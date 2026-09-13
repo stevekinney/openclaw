@@ -68,9 +68,7 @@ describe("Android Access native workflow", () => {
     );
     expect(job.if).toBe("needs.preflight.outputs.run_android_access_native == 'true'");
     expect(step.run).toContain(":app:connectedPlayDebugAndroidTest");
-    expect(step.run).toContain(
-      '-Pandroid.testInstrumentationRunnerArguments.class="$ACCESS_NATIVE_TEST_CLASSES"',
-    );
+    expect(step.run).toContain('"$native_test_filter"');
     expect(step.run).toContain(
       "export ACCESS_NATIVE_TEST_CLASSES=ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest",
     );
@@ -80,6 +78,36 @@ describe("Android Access native workflow", () => {
     expect(workflow.jobs["ci-gate"].steps[0].env.JOB_RESULTS).toContain(
       "android-access-native=${{ needs.android-access-native.result }}|${{ needs.preflight.outputs.run_android_access_native }}",
     );
+  });
+
+  it("selects both Debug methods through AGP's comma-separated arguments and adb shell quoting", () => {
+    const assignment = step.run
+      .split("\n")
+      .find((line: string) => line.startsWith("native_test_filter="));
+    expect(assignment).toBeDefined();
+    const result = spawnSync("bash", ["-c", `${assignment}\nprintf '%s' "$native_test_filter"`], {
+      encoding: "utf8",
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const prefix = "-Pandroid.testInstrumentationRunnerArguments.tests_regex=";
+    expect(result.stdout.startsWith(prefix)).toBe(true);
+    const value = result.stdout.slice(prefix.length);
+    expect(value).not.toContain(",");
+    expect(value.startsWith("'") && value.endsWith("'")).toBe(true);
+    const remote = spawnSync("bash", ["-c", `printf '%s' ${value}`], { encoding: "utf8" });
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(remote.stdout.startsWith("^") && remote.stdout.endsWith("$")).toBe(true);
+    const selection = new RegExp(remote.stdout);
+    const methods = [
+      "ai.openclaw.app.gateway.CloudflareAccessNativeTest#packagedSodiumLoadsAndDecryptsTheGoTransferVector",
+      "ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest#encryptedGrantRestoresAndDeletesWithoutChangingGatewayPairing",
+    ];
+    for (const method of methods) {
+      expect(selection.test(method)).toBe(true);
+      expect(selection.test(`other.${method}`)).toBe(false);
+      expect(selection.test(`${method}Extra`)).toBe(false);
+      expect(selection.test(method.replace(/#.+$/, "#otherMethod"))).toBe(false);
+    }
   });
 
   it("requires ordinary and strict simulated 16 KiB packaged execution", () => {

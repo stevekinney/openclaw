@@ -6157,44 +6157,13 @@ jobs:
             test "$(adb -s emulator-5554 shell getprop pm.16kb.app_compat.disabled | tr -d '\r')" = true
           fi
           export ACCESS_NATIVE_TEST_CLASSES=ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest
+          # AGP 9.4 splits instrumentation values on commas; quote the exact regex for adb's remote shell.
+          native_test_filter="-Pandroid.testInstrumentationRunnerArguments.tests_regex='^ai[.]openclaw[.]app[.]gateway[.](CloudflareAccessNativeTest#packagedSodiumLoadsAndDecryptsTheGoTransferVector|CloudflareAccessPersistenceNativeTest#encryptedGrantRestoresAndDeletesWithoutChangingGatewayPairing)$'"
           node --import ./scripts/tsx.mjs scripts/run-android-gradle.mts \
             :app:connectedPlayDebugAndroidTest \
             -Pandroid.testInstrumentationRunnerArguments.expectedPageSize="$EXPECTED_PAGE_SIZE" \
-            -Pandroid.testInstrumentationRunnerArguments.class="$ACCESS_NATIVE_TEST_CLASSES" \
+            "$native_test_filter" \
             -PopenclawBuildTimestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          # Diagnose runner discovery without counting log-only enumeration as test execution.
-          python3 - <<'NATIVE_DISCOVERY'
-          from pathlib import Path
-          import json
-          import os
-          import re
-          import subprocess
-          classes = os.environ['ACCESS_NATIVE_TEST_CLASSES'].split(',')
-          for name in classes:
-              candidates = list(Path('apps/android/app/build').rglob(name.rsplit('.', 1)[1] + '.class'))
-              assert len(candidates) == 1, f'Expected one compiled native fixture: {name}'
-              result = subprocess.run([str(Path(os.environ['JAVA_HOME']) / 'bin/javap'), '-public', '-v', str(candidates[0])], check=True, capture_output=True, text=True, timeout=30)
-              methods = re.split(r'(?=^  public )', result.stdout, flags=re.MULTILINE)
-              annotated = [method for method in methods if re.search(r'^        org\.junit\.Test(?:\(|$)', method, re.MULTILINE)]
-              assert annotated, f'No runtime JUnit test annotation in {name}'
-              for method in annotated:
-                  print(f'Compiled native test: {name}: {method.splitlines()[0].strip()} @org.junit.Test', flush=True)
-          metadata = [json.loads(path.read_text()) for path in Path('apps/android/app/build/outputs/apk/androidTest').rglob('output-metadata.json')]
-          metadata = [entry for entry in metadata if entry['variantName'] == 'playDebugAndroidTest']
-          assert len(metadata) == 1 and metadata[0]['artifactType']['type'] == 'APK', 'Missing built playDebug instrumentation metadata'
-          package = metadata[0]['applicationId']
-          installed = subprocess.run(['adb', '-s', 'emulator-5554', 'shell', 'pm', 'list', 'instrumentation'], check=True, capture_output=True, text=True, timeout=30).stdout
-          components = re.findall(r'^instrumentation:(' + re.escape(package) + r'/[^ ]+) ', installed, re.MULTILINE)
-          if not components:
-              print('Native discovery unavailable: the built test APK is not installed; compiled signatures above remain diagnostic only.', flush=True)
-          else:
-              assert len(components) == 1 and components[0].endswith('/androidx.test.runner.AndroidJUnitRunner'), 'Unexpected installed instrumentation runner'
-              result = subprocess.run(['adb', '-s', 'emulator-5554', 'shell', 'am', 'instrument', '-w', '-r', '-e', 'log', 'true', '-e', 'class', ','.join(classes), components[0]], check=True, capture_output=True, text=True, timeout=60)
-              for line in result.stdout.splitlines():
-                  if re.fullmatch(r'INSTRUMENTATION_STATUS: (?:class|test|numtests|current)=[A-Za-z0-9_.$# -]+', line) or re.fullmatch(r'INSTRUMENTATION_(?:STATUS_)?CODE: -?\d+', line):
-                      print('Native discovery only: ' + line, flush=True)
-              assert 'INSTRUMENTATION_CODE: -1' in result.stdout, 'Log-only native discovery did not finish'
-          NATIVE_DISCOVERY
           apk="$(python3 - <<'PY'
           from pathlib import Path
           import json
