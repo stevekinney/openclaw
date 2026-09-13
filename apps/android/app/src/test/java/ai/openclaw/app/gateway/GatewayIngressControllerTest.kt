@@ -33,6 +33,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import java.lang.management.ManagementFactory
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
@@ -735,6 +736,34 @@ class GatewayIngressControllerTest {
         lateinit var owner: GatewayIngressController
         var checkpoint = 0L
         var gateFailure: Throwable? = null
+        lateinit var ingressMonitor: Any
+        lateinit var storeMonitor: Any
+        val threads = ManagementFactory.getThreadMXBean()
+
+        fun awaitMonitor(
+          worker: Thread,
+          monitor: Any,
+          ownerId: Long,
+          declaringClass: Class<*>,
+          method: String,
+          deadline: Long,
+        ) {
+          while (true) {
+            val info = threads.getThreadInfo(worker.id, 32)
+            check(info != null && info.threadState != Thread.State.TERMINATED && System.nanoTime() < deadline) {
+              "${worker.name} did not reach $method: state=${info?.threadState}, lock=${info?.lockInfo}, owner=${info?.lockOwnerId}, stack=${info?.stackTrace?.take(4)}"
+            }
+            if (info.threadState == Thread.State.BLOCKED &&
+              info.lockInfo?.className == monitor.javaClass.name &&
+              info.lockInfo?.identityHashCode == System.identityHashCode(monitor) &&
+              info.lockOwnerId == ownerId &&
+              info.stackTrace.any { it.className == declaringClass.name && it.methodName == method }
+            ) {
+              return
+            }
+            Thread.sleep(1)
+          }
+        }
 
         fun worker(
           name: String,
@@ -758,18 +787,11 @@ class GatewayIngressControllerTest {
                 try {
                   departingWorker.start()
                   val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-                  while (departingWorker.state != Thread.State.BLOCKED || departingWorker.stackTrace.none { it.className == CloudflareAccessSessionStore::class.java.name && it.methodName in setOf("forget", "reserveForget") }) {
-                    check(departingWorker.isAlive && System.nanoTime() < deadline) { "Departure did not reach the held store monitor" }
-                    Thread.sleep(1)
-                  }
+                  // One snapshot must identify the actual monitor and owner; unrelated
+                  // VM/class-loading contention is not evidence of crossing this boundary.
+                  awaitMonitor(departingWorker, storeMonitor, Thread.currentThread().id, CloudflareAccessSessionStore::class.java, "reserveForget", deadline)
                   incomingWorker.start()
-                  while (incomingWorker.state != Thread.State.BLOCKED) {
-                    check(incomingWorker.isAlive && System.nanoTime() < deadline) { "Incoming profile did not reach admission" }
-                    Thread.sleep(1)
-                  }
-                  check(incomingWorker.stackTrace.any { it.className == GatewayIngressController::class.java.name && it.methodName == "register" }) {
-                    "Incoming profile crossed the last-owner decision before revocation was reserved"
-                  }
+                  awaitMonitor(incomingWorker, ingressMonitor, departingWorker.id, GatewayIngressController::class.java, "register", deadline)
                 } catch (error: Throwable) {
                   gateFailure = error
                 }
@@ -790,6 +812,16 @@ class GatewayIngressControllerTest {
               .getDeclaredField("store")
               .apply { isAccessible = true }
               .get(owner) as CloudflareAccessSessionStore
+          ingressMonitor =
+            GatewayIngressController::class.java
+              .getDeclaredField("lock")
+              .apply { isAccessible = true }
+              .get(owner)
+          storeMonitor =
+            CloudflareAccessSessionStore::class.java
+              .getDeclaredField("lock")
+              .apply { isAccessible = true }
+              .get(store)
           // Hold the actual store monitor before O is revoked. Its reserving caller
           // must retain ingress ownership, so another profile cannot pass registration.
           store.snapshot(gateOrigin)
