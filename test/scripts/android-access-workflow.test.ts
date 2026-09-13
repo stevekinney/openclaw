@@ -14,7 +14,9 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 function verifyReports(mode: string) {
   const root = tempDirs.make("openclaw-access-reports-");
   const verification = step.run.split("python3 - <<'PY'\n")[1]?.split("\nPY")[0];
-  if (!verification) throw new Error("Missing native report verification");
+  if (!verification) {
+    throw new Error("Missing native report verification");
+  }
   return spawnSync(
     "python3",
     [
