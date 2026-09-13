@@ -749,7 +749,7 @@ class GatewayIngressControllerTest {
           deadline: Long,
         ) {
           while (true) {
-            val info = threads.getThreadInfo(worker.id, 32)
+            val info = threads.getThreadInfo(worker.threadId(), 32)
             check(info != null && info.threadState != Thread.State.TERMINATED && System.nanoTime() < deadline) {
               "${worker.name} did not reach $method: state=${info?.threadState}, lock=${info?.lockInfo}, owner=${info?.lockOwnerId}, stack=${info?.stackTrace?.take(4)}"
             }
@@ -789,9 +789,9 @@ class GatewayIngressControllerTest {
                   val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
                   // One snapshot must identify the actual monitor and owner; unrelated
                   // VM/class-loading contention is not evidence of crossing this boundary.
-                  awaitMonitor(departingWorker, storeMonitor, Thread.currentThread().id, CloudflareAccessSessionStore::class.java, "reserveForget", deadline)
+                  awaitMonitor(departingWorker, storeMonitor, Thread.currentThread().threadId(), CloudflareAccessSessionStore::class.java, "reserveForget", deadline)
                   incomingWorker.start()
-                  awaitMonitor(incomingWorker, ingressMonitor, departingWorker.id, GatewayIngressController::class.java, "register", deadline)
+                  awaitMonitor(incomingWorker, ingressMonitor, departingWorker.threadId(), GatewayIngressController::class.java, "register", deadline)
                 } catch (error: Throwable) {
                   gateFailure = error
                 }
@@ -813,15 +813,19 @@ class GatewayIngressControllerTest {
               .apply { isAccessible = true }
               .get(owner) as CloudflareAccessSessionStore
           ingressMonitor =
-            GatewayIngressController::class.java
-              .getDeclaredField("lock")
-              .apply { isAccessible = true }
-              .get(owner)
+            checkNotNull(
+              GatewayIngressController::class.java
+                .getDeclaredField("lock")
+                .apply { isAccessible = true }
+                .get(owner),
+            )
           storeMonitor =
-            CloudflareAccessSessionStore::class.java
-              .getDeclaredField("lock")
-              .apply { isAccessible = true }
-              .get(store)
+            checkNotNull(
+              CloudflareAccessSessionStore::class.java
+                .getDeclaredField("lock")
+                .apply { isAccessible = true }
+                .get(store),
+            )
           // Hold the actual store monitor before O is revoked. Its reserving caller
           // must retain ingress ownership, so another profile cannot pass registration.
           store.snapshot(gateOrigin)
