@@ -21,14 +21,17 @@ function verifyReports(mode: string) {
       "-c",
       String.raw`
 from pathlib import Path
-import json, sys, zipfile
+import json, os, sys, zipfile
 mode = sys.argv[1]
 reports = Path('apps/android/app/build/outputs/androidTest-results/connected/debug')
 reports.mkdir(parents=True)
-name = 'OtherTest' if mode == 'wrong-class' else 'ai.openclaw.app.gateway.CloudflareAccessNativeTest'
-child = '<failure/>' if mode == 'failed' else '<skipped/>' if mode == 'skipped' else ''
-case = '' if mode == 'empty' else f'<testcase classname="{name}" name="vector">{child}</testcase>'
-(reports / 'TEST-device.xml').write_text(f'<testsuite>{case}</testsuite>')
+names = os.environ['ACCESS_NATIVE_TEST_CLASSES'].split(',')
+if mode == 'wrong-class': names[0] = 'OtherTest'
+if mode == 'missing-store': names = names[:1]
+if mode == 'duplicate': names.append(names[0])
+child = '<failure/>' if mode == 'failed' else '<error/>' if mode == 'error' else '<skipped/>' if mode == 'skipped' else ''
+cases = '' if mode == 'empty' else ''.join(f'<testcase classname="{name}" name="native">{child}</testcase>' for name in names)
+(reports / 'TEST-device.xml').write_text(f'<testsuite>{cases}</testsuite>')
 apk = Path('apps/android/app/build/outputs/apk/play/debug/openclaw-2099.1.2-play-debug.apk')
 apk.parent.mkdir(parents=True)
 element = {'outputFile': '../outside.apk' if mode == 'outside-output' else apk.name, 'filters': []}
@@ -42,7 +45,15 @@ with zipfile.ZipFile(apk, 'w') as archive:
 ` + verification,
       mode,
     ],
-    { cwd: root, encoding: "utf8" },
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ACCESS_NATIVE_TEST_CLASSES:
+          "ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest",
+      },
+    },
   );
 }
 
@@ -56,7 +67,10 @@ describe("Android Access native workflow", () => {
     expect(job.if).toBe("needs.preflight.outputs.run_android_access_native == 'true'");
     expect(step.run).toContain(":app:connectedPlayDebugAndroidTest");
     expect(step.run).toContain(
-      "-Pandroid.testInstrumentationRunnerArguments.class=ai.openclaw.app.gateway.CloudflareAccessNativeTest",
+      '-Pandroid.testInstrumentationRunnerArguments.class="$ACCESS_NATIVE_TEST_CLASSES"',
+    );
+    expect(step.run).toContain(
+      "export ACCESS_NATIVE_TEST_CLASSES=ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest",
     );
     expect(step.run).toContain('zipalign" -c -P 16 -v 4');
     expect(step.run).toContain('zipalign" -c -P 16 -v 4 "$apk"');
@@ -114,7 +128,7 @@ ${guard}`,
     }
   });
 
-  it("accepts an executed passing native vector and all four packaged ABIs", () => {
+  it("accepts executed native crypto and persistence tests with all four packaged ABIs", () => {
     const result = verifyReports("passed");
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout.trim()).toBe(
@@ -124,6 +138,9 @@ ${guard}`,
 
   it.each([
     "empty",
+    "duplicate",
+    "missing-store",
+    "error",
     "wrong-class",
     "failed",
     "skipped",
