@@ -54,7 +54,13 @@ internal class CloudflareAccessSessionStore(
     val origin: CloudflareAccessOrigin,
     val transitionRevision: Long,
     val task: Deferred<Unit>,
-  )
+    private val supersededAttempt: Deferred<Snapshot>? = null,
+  ) {
+    fun start() {
+      supersededAttempt?.cancel()
+      task.start()
+    }
+  }
 
   private class Lifecycle(
     var state: State,
@@ -225,21 +231,23 @@ internal class CloudflareAccessSessionStore(
     return retirement
   }
 
-  fun forget(origin: CloudflareAccessOrigin): Retirement {
-    val (attempt, retirement) =
-      synchronized(lock) {
-        val attempt = attempts.remove(origin)
-        sessions.remove(origin)
-        setState(origin, State.SignedOut)
-        lifecycle.getValue(origin).lastRevokedRevision = revision
-        attempt to queueRetirement(origin)
-      }
-    attempt?.task?.cancel()
-    retirement.task.start()
-    return retirement
-  }
+  fun forget(origin: CloudflareAccessOrigin): Retirement = reserveForget(origin).also { it.start() }
 
-  private fun queueRetirement(origin: CloudflareAccessOrigin): Retirement {
+  // Ingress may reserve while committing a last-owner decision. Cancellation and
+  // coroutine starts belong to the returned handle, after all owner locks release.
+  fun reserveForget(origin: CloudflareAccessOrigin): Retirement =
+    synchronized(lock) {
+      val attempt = attempts.remove(origin)
+      sessions.remove(origin)
+      setState(origin, State.SignedOut)
+      lifecycle.getValue(origin).lastRevokedRevision = revision
+      queueRetirement(origin, attempt?.task)
+    }
+
+  private fun queueRetirement(
+    origin: CloudflareAccessOrigin,
+    supersededAttempt: Deferred<Snapshot>? = null,
+  ): Retirement {
     val previous = retirements[origin]?.task
     val id = UUID.randomUUID()
     val task =
@@ -254,7 +262,7 @@ internal class CloudflareAccessSessionStore(
           }
         }
       }
-    val retirement = Retirement(id, origin, lifecycle.getValue(origin).transitionRevision, task)
+    val retirement = Retirement(id, origin, lifecycle.getValue(origin).transitionRevision, task, supersededAttempt)
     retirements[origin] = retirement
     return retirement
   }

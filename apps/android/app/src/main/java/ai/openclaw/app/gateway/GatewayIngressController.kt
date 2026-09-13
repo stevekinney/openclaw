@@ -169,23 +169,43 @@ internal class GatewayIngressController(
     }
     checkRegistration(registration, isCurrent)
     val origin = registration.origin
-    val oldOrigin =
+    val previousRetirement =
       synchronized(lock) {
         checkRegistrationLocked(registration, isCurrent)
-        registry.entries.value
-          .firstOrNull { it.stableId == endpoint.stableId }
-          ?.accessOrigin
-          ?.takeIf { it != origin.uri.toString() }
-          ?.also {
-            if (!registry.setAccessOrigin(endpoint.stableId, null)) {
-              throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
-            }
-            publishLocked()
+        val previous =
+          registry.entries.value
+            .firstOrNull { it.stableId == endpoint.stableId }
+            ?.accessOrigin
+            ?.takeIf { it != origin.uri.toString() }
+        if (previous != null && registry.entries.value.any { it.stableId != endpoint.stableId && it.accessOrigin == previous }) {
+          // Release a shared association atomically so the final departing profile
+          // still owns retirement. The last owner stays durable until deletion succeeds.
+          if (!registry.setAccessOrigin(endpoint.stableId, null)) {
+            throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
           }
+          publishLocked()
+          null
+        } else {
+          previous?.let { store.reserveForget(CloudflareAccessOrigin.from(it)) }
+        }
       }
-    if (oldOrigin != null && registry.entries.value.none { it.accessOrigin == oldOrigin }) {
-      store.forget(CloudflareAccessOrigin.from(oldOrigin)).task.await()
+    if (previousRetirement != null) {
+      previousRetirement.start()
+      previousRetirement.task.await()
       checkRegistration(registration, isCurrent)
+      synchronized(lock) {
+        checkRegistrationLocked(registration, isCurrent)
+        if (registry.entries.value
+            .firstOrNull { it.stableId == endpoint.stableId }
+            ?.accessOrigin != previousRetirement.origin.uri.toString()
+        ) {
+          throw CancellationException("Gateway association superseded")
+        }
+        if (!registry.setAccessOrigin(endpoint.stableId, null)) {
+          throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
+        }
+        publishLocked()
+      }
     }
     // Existing service headers or WARP must remain independent of a cached browser
     // grant. Only a verified Access challenge admits managed credentials for this profile.
