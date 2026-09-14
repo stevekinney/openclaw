@@ -65,6 +65,7 @@ internal class GatewayIngressController(
       val action: GatewayAccessAttention,
       val entry: GatewayRegistryEntry,
       val registration: Registration?,
+      val acknowledgement: PendingAcknowledgement?,
     ) : RetryOwner
 
     class Acquired(
@@ -76,7 +77,9 @@ internal class GatewayIngressController(
     val action: GatewayAccessAttention,
     val registration: Registration?,
     val origin: CloudflareAccessOrigin,
-  )
+  ) {
+    var completedAction: GatewayAccessAttention? = null
+  }
 
   private class BrowserIntent(
     val id: UUID,
@@ -420,7 +423,13 @@ internal class GatewayIngressController(
     private val isCurrent: () -> Boolean,
   ) {
     val stableId: String = action.stableId
-    private var owner: RetryOwner = RetryOwner.Captured(action, entry, registrations[stableId])
+    private var owner: RetryOwner =
+      RetryOwner.Captured(
+        action,
+        entry,
+        registrations[stableId],
+        pendingAcknowledgement?.takeIf { it.action === action && isAcknowledgementRegisteredLocked(it) },
+      )
 
     suspend fun prepare(
       endpoint: GatewayEndpoint,
@@ -446,8 +455,11 @@ internal class GatewayIngressController(
     private fun ownsPresentationLocked(): Boolean =
       when (val captured = owner) {
         is RetryOwner.Captured -> {
+          // Only this captured Sign out owner may advance the action before Retry acquires it.
+          // Its completion still settles the UI when a queued Retry is stopped before running.
+          val action = captured.acknowledgement?.completedAction ?: captured.action
           registrations[stableId] === captured.registration &&
-            registry.entries.value.any { it === captured.entry } && mutablePresentation.value.attention === captured.action
+            registry.entries.value.any { it === captured.entry } && mutablePresentation.value.attention === action
         }
 
         is RetryOwner.Acquired -> {
@@ -641,7 +653,7 @@ internal class GatewayIngressController(
     task?.cancel()
     expiry?.cancel()
     observeRetirement(retirement) { succeeded ->
-      if (acknowledgement != null && mutablePresentation.value.attention === acknowledgement.action &&
+      if (acknowledgement != null && pendingAcknowledgement === acknowledgement && mutablePresentation.value.attention === acknowledgement.action &&
         ownsRetirementPresentationLocked(retirement, acknowledgement.action.stableId, acknowledgement.registration)
       ) {
         val message =
@@ -650,7 +662,9 @@ internal class GatewayIngressController(
           } else {
             "Could not clear this host’s saved Access session. Try Sign out again."
           }
-        publishLocked(attention = GatewayAccessAttention(acknowledgement.action.stableId, message))
+        val completedAction = GatewayAccessAttention(acknowledgement.action.stableId, message)
+        acknowledgement.completedAction = completedAction
+        publishLocked(attention = completedAction)
       }
     }
     return retirement.task
