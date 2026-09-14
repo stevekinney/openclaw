@@ -14,6 +14,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -362,21 +363,24 @@ class GatewayIngressControllerTest {
             val firstDrain = CompletableDeferred<Unit>()
             val secondDrain = CompletableDeferred<Unit>()
             var drainCount = 0
+            val uncaught = mutableListOf<Throwable>()
+            val supervisor = SupervisorJob()
+            val scope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
             val owner =
-              GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {
+              GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, {
                 if (++drainCount == 1) firstDrain.await() else secondDrain.await()
               }, clientForRoute = { _, _ -> client { false } })
-            if (ordinarySibling) {
-              assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
-              assertEquals(
-                application.origin.uri.toString(),
-                registry.entries.value
-                  .first { it.stableId == sibling.stableId }
-                  .accessOrigin,
-              )
-            }
-            val first = checkNotNull(owner.signOut(endpoint.stableId))
             try {
+              if (ordinarySibling) {
+                assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
+                assertEquals(
+                  application.origin.uri.toString(),
+                  registry.entries.value
+                    .first { it.stableId == sibling.stableId }
+                    .accessOrigin,
+                )
+              }
+              val first = checkNotNull(owner.signOut(endpoint.stableId))
               runCurrent()
               val original = checkNotNull(owner.presentation.value.attention)
               // Changing selection must not strand the still-registered presentation owner.
@@ -401,13 +405,17 @@ class GatewayIngressControllerTest {
                 if (ordinarySibling) assertTrue(original === pending)
               }
               firstDrain.complete(Unit)
-              assertEquals(deleteSucceeds, runCatching { first.await() }.isSuccess)
+              val firstResult = runCatching { first.await() }
+              assertEquals(deleteSucceeds, firstResult.isSuccess)
+              if (!deleteSucceeds) assertEquals(CloudflareAccessException.Kind.StorageFailed, (firstResult.exceptionOrNull() as? CloudflareAccessException)?.kind)
               runCurrent()
               assertEquals(2, drainCount)
               assertFalse(second.isCompleted)
               assertTrue(pending === owner.presentation.value.attention)
               secondDrain.complete(Unit)
-              assertEquals(deleteSucceeds, runCatching { second.await() }.isSuccess)
+              val secondResult = runCatching { second.await() }
+              assertEquals(deleteSucceeds, secondResult.isSuccess)
+              if (!deleteSucceeds) assertEquals(CloudflareAccessException.Kind.StorageFailed, (secondResult.exceptionOrNull() as? CloudflareAccessException)?.kind)
               runCurrent()
               assertEquals(if (deleteSucceeds) null else encoded, storage.values[application.origin])
               if (failure != null) {
@@ -425,6 +433,8 @@ class GatewayIngressControllerTest {
             } finally {
               firstDrain.complete(Unit)
               secondDrain.complete(Unit)
+              supervisor.cancelAndJoin()
+              assertTrue(uncaught.isEmpty())
             }
           }
         }
@@ -444,8 +454,11 @@ class GatewayIngressControllerTest {
         val probe = CompletableDeferred<Unit>()
         var entered = false
         val replacement = endpoint.copy(contextPath = "/replacement/socket")
+        val uncaught = mutableListOf<Throwable>()
+        val supervisor = SupervisorJob()
+        val scope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { target, _ ->
+          GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { target, _ ->
             client { request ->
               if (target == replacement) {
                 entered = true
@@ -455,11 +468,11 @@ class GatewayIngressControllerTest {
               target.stableId != sibling.stableId && request.header("Cf-Access-Token") == null
             }
           })
-        assertNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
-        assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
-        val stopped = checkNotNull(owner.signOut(endpoint.stableId))
         var preparing: Deferred<Result<GatewayIngressAuthorization?>>? = null
         try {
+          assertNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+          assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
+          val stopped = checkNotNull(owner.signOut(endpoint.stableId))
           runCurrent()
           assertEquals("Signing out…", checkNotNull(owner.presentation.value.attention).message)
           preparing = async { runCatching { owner.prepare(replacement, tls, false, owner.admissionCheckpoint()) { true } } }
@@ -470,8 +483,12 @@ class GatewayIngressControllerTest {
           val siblingStop = checkNotNull(owner.signOut(sibling.stableId))
           assertNull(owner.presentation.value.attention)
           drain.complete(Unit)
-          assertEquals(deleteSucceeds, runCatching { stopped.await() }.isSuccess)
-          assertEquals(deleteSucceeds, runCatching { siblingStop.await() }.isSuccess)
+          val stoppedResult = runCatching { stopped.await() }
+          assertEquals(deleteSucceeds, stoppedResult.isSuccess)
+          if (!deleteSucceeds) assertEquals(CloudflareAccessException.Kind.StorageFailed, (stoppedResult.exceptionOrNull() as? CloudflareAccessException)?.kind)
+          val siblingStopResult = runCatching { siblingStop.await() }
+          assertEquals(deleteSucceeds, siblingStopResult.isSuccess)
+          if (!deleteSucceeds) assertEquals(CloudflareAccessException.Kind.StorageFailed, (siblingStopResult.exceptionOrNull() as? CloudflareAccessException)?.kind)
           runCurrent()
           assertNull(owner.presentation.value.attention)
           probe.complete(Unit)
@@ -480,7 +497,9 @@ class GatewayIngressControllerTest {
         } finally {
           drain.complete(Unit)
           probe.complete(Unit)
-          preparing?.cancel()
+          preparing?.cancelAndJoin()
+          supervisor.cancelAndJoin()
+          assertTrue(uncaught.isEmpty())
         }
       }
     }
