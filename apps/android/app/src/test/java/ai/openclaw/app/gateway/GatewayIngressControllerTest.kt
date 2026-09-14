@@ -441,6 +441,131 @@ class GatewayIngressControllerTest {
       }
     }
 
+  @Test fun coldSignOutKeepsFirstRegistrationThroughAcknowledgement() =
+    runTest {
+      for (acknowledgeFirst in listOf(false, true)) {
+        for (captureRetryFirst in listOf(false, true)) {
+          for (deleteSucceeds in listOf(false, true)) {
+            val registry = registry()
+            registry.setAccessOrigin(endpoint.stableId, application.origin)
+            val storage = Storage().also { it.deleteSucceeds = deleteSucceeds }
+            val encoded = CloudflareAccessTestTokens.session().encode()
+            storage.values[application.origin] = encoded
+            val drain = CompletableDeferred<Unit>()
+            val approved = CompletableDeferred<CloudflareAccessSession>()
+            var prompts = 0
+            val uncaught = mutableListOf<Throwable>()
+            val supervisor = SupervisorJob()
+            val scope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
+            val owner =
+              GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+                prompts += 1
+                open("https://example.cloudflareaccess.com/login")
+                approved.await()
+              })
+            var preparing: Deferred<Result<GatewayIngressAuthorization?>>? = null
+            try {
+              val oldCheckpoint = owner.admissionCheckpoint()
+              val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+              runCurrent()
+              val pending = checkNotNull(owner.presentation.value.attention)
+              assertEquals("Signing out…", pending.message)
+              assertFalse(stopped.isCompleted)
+              assertEquals(encoded, storage.values[application.origin])
+              val queued = if (captureRetryFirst) checkNotNull(owner.retry(owner.admissionCheckpoint()) { true }) else null
+              if (acknowledgeFirst) {
+                drain.complete(Unit)
+                assertEquals(deleteSucceeds, runCatching { stopped.await() }.isSuccess)
+                runCurrent()
+              }
+              val beforeRegistration = checkNotNull(owner.presentation.value.attention)
+              assertTrue(runCatching { owner.prepare(endpoint, tls, true, oldCheckpoint) { true } }.exceptionOrNull() is CancellationException)
+              assertTrue(beforeRegistration === owner.presentation.value.attention)
+              assertEquals(0, prompts)
+              assertNull(owner.presentation.value.browserLaunch)
+              val denied = checkNotNull(owner.authorization(endpoint))
+              val request = Request.Builder().url(buildGatewayWebSocketUrl(endpoint.host, endpoint.port, true, endpoint.contextPath)).build()
+              assertTrue(runCatching { denied.requireCurrent(request) }.exceptionOrNull() is GatewayExternalAuthorizationException)
+              if (!acknowledgeFirst) {
+                assertFalse(stopped.isCompleted)
+                drain.complete(Unit)
+                assertEquals(deleteSucceeds, runCatching { stopped.await() }.isSuccess)
+                runCurrent()
+              }
+              val completed = checkNotNull(owner.presentation.value.attention)
+              assertFalse(pending === completed)
+              assertTrue(completed.message.contains(if (deleteSucceeds) "is signed out" else "Try Sign out again"))
+              assertEquals(if (deleteSucceeds) null else encoded, storage.values[application.origin])
+              storage.deleteSucceeds = true
+              val retry = queued ?: checkNotNull(owner.retry(owner.admissionCheckpoint()) { true })
+              preparing = scope.async { runCatching { retry.prepare(endpoint, tls) } }
+              runCurrent()
+              assertEquals(1, prompts)
+              val launch = checkNotNull(owner.presentation.value.browserLaunch)
+              assertEquals("https://example.cloudflareaccess.com/login", owner.consumeBrowserLaunch(launch.attemptId))
+              assertFalse(preparing.isCompleted)
+              val session = CloudflareAccessTestTokens.session("cold-retry")
+              approved.complete(session)
+              assertNotNull(preparing.await().getOrThrow())
+              assertEquals(session.encode(), storage.values[application.origin])
+              assertNull(owner.presentation.value.attention)
+              assertEquals(1, prompts)
+            } finally {
+              drain.complete(Unit)
+              preparing?.cancelAndJoin()
+              supervisor.cancelAndJoin()
+              assertTrue(uncaught.isEmpty())
+            }
+          }
+        }
+      }
+    }
+
+  @Test fun coldSignOutCannotBindAReplacedSavedEntry() =
+    runTest {
+      for (acknowledgeFirst in listOf(false, true)) {
+        val registry = registry()
+        registry.setAccessOrigin(endpoint.stableId, application.origin)
+        val storage = Storage()
+        storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
+        val drain = CompletableDeferred<Unit>()
+        var prompts = 0
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, _ ->
+            prompts += 1
+            CloudflareAccessTestTokens.session()
+          })
+        val oldCheckpoint = owner.admissionCheckpoint()
+        val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+        try {
+          runCurrent()
+          val queued = checkNotNull(owner.retry(owner.admissionCheckpoint()) { true })
+          if (acknowledgeFirst) {
+            drain.complete(Unit)
+            stopped.await()
+            runCurrent()
+          }
+          val saved = registry.entries.value.first { it.stableId == endpoint.stableId }
+          registry.upsert(saved.copy(name = "Replaced saved entry"))
+          // Register before the queued registry collector can clear the old action.
+          assertTrue(runCatching { owner.prepare(endpoint, tls, true, oldCheckpoint) { true } }.exceptionOrNull() is CancellationException)
+          assertNull(owner.presentation.value.attention)
+          drain.complete(Unit)
+          stopped.await()
+          runCurrent()
+          assertNull(owner.presentation.value.attention)
+          assertTrue(runCatching { queued.prepare(endpoint, tls) }.exceptionOrNull() is CancellationException)
+          assertEquals(0, prompts)
+          assertNull(owner.presentation.value.browserLaunch)
+          val denied = checkNotNull(owner.authorization(endpoint))
+          val request = Request.Builder().url(buildGatewayWebSocketUrl(endpoint.host, endpoint.port, true, endpoint.contextPath)).build()
+          assertTrue(runCatching { denied.requireCurrent(request) }.exceptionOrNull() is GatewayExternalAuthorizationException)
+        } finally {
+          drain.complete(Unit)
+        }
+      }
+    }
+
   @Test fun pendingSignOutCannotAdoptAReplacementRegistrationDuringItsRawProbe() =
     runTest {
       for (deleteSucceeds in listOf(false, true)) {
