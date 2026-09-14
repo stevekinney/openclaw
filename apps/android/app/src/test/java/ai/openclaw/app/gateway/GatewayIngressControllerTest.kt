@@ -272,6 +272,266 @@ class GatewayIngressControllerTest {
       assertTrue(runCatching { first.requireCurrent(request) }.exceptionOrNull() is GatewayExternalAuthorizationException)
     }
 
+  @Test fun signOutAcknowledgesOnlyAfterDurableDeletion() =
+    runTest {
+      val storage = Storage()
+      val encoded = CloudflareAccessTestTokens.session().encode()
+      storage.values[application.origin] = encoded
+      val drain = CompletableDeferred<Unit>()
+      var deleteEntered = false
+      lateinit var owner: GatewayIngressController
+      val persistence =
+        CloudflareAccessSessionStore.Persistence(
+          load = storage.persistence.load,
+          save = storage.persistence.save,
+          delete = { origin ->
+            deleteEntered = true
+            assertEquals(
+              "Signing out…",
+              owner.presentation.value.attention
+                ?.message,
+            )
+            storage.persistence.delete(origin)
+          },
+        )
+      owner = GatewayIngressController(backgroundScope, registry(), persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() })
+      val lease = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+      val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+      try {
+        runCurrent()
+        assertEquals(
+          "Signing out…",
+          owner.presentation.value.attention
+            ?.message,
+        )
+        assertFalse(stopped.isCompleted)
+        assertFalse(deleteEntered)
+        assertEquals(encoded, storage.values[application.origin])
+        assertTrue(runCatching { lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build()) }.exceptionOrNull() is GatewayExternalAuthorizationException)
+        drain.complete(Unit)
+        stopped.await()
+        runCurrent()
+        assertTrue(deleteEntered)
+        assertNull(storage.values[application.origin])
+        assertTrue(checkNotNull(owner.presentation.value.attention).message.contains("is signed out"))
+      } finally {
+        drain.complete(Unit)
+      }
+    }
+
+  @Test fun completedSignOutPreservesNewerUnavailableGatewayFailure() =
+    runTest {
+      val registry = registry()
+      registry.setAccessOrigin(endpoint.stableId, application.origin)
+      val storage = Storage()
+      val encoded = CloudflareAccessTestTokens.session().encode()
+      storage.values[application.origin] = encoded
+      val drain = CompletableDeferred<Unit>()
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() })
+      val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+      try {
+        runCurrent()
+        assertFalse(stopped.isCompleted)
+        assertEquals(encoded, storage.values[application.origin])
+        checkNotNull(owner.retry(owner.admissionCheckpoint()) { true }).reportFailure("Saved endpoint unavailable")
+        val failure = checkNotNull(owner.presentation.value.attention)
+        assertEquals("Saved endpoint unavailable", failure.message)
+        drain.complete(Unit)
+        stopped.await()
+        runCurrent()
+        assertNull(storage.values[application.origin])
+        assertTrue(failure === owner.presentation.value.attention)
+      } finally {
+        drain.complete(Unit)
+      }
+    }
+
+  @Test fun sharedHostSignOutResolvesOnlyItsCapturedPresentationOwner() =
+    runTest {
+      for (ordinarySibling in listOf(false, true)) {
+        for (deleteSucceeds in listOf(false, true)) {
+          for (newerFailure in listOf(false, true)) {
+            val registry = registry()
+            val sibling = endpoint.copy(stableId = "sign-out-sibling")
+            add(registry, sibling)
+            registry.setAccessOrigin(endpoint.stableId, application.origin)
+            registry.setAccessOrigin(sibling.stableId, application.origin)
+            val storage = Storage().also { it.deleteSucceeds = deleteSucceeds }
+            val encoded = CloudflareAccessTestTokens.session().encode()
+            storage.values[application.origin] = encoded
+            val firstDrain = CompletableDeferred<Unit>()
+            val secondDrain = CompletableDeferred<Unit>()
+            var drainCount = 0
+            val owner =
+              GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {
+                if (++drainCount == 1) firstDrain.await() else secondDrain.await()
+              }, clientForRoute = { _, _ -> client { false } })
+            if (ordinarySibling) {
+              assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
+              assertEquals(
+                application.origin.uri.toString(),
+                registry.entries.value
+                  .first { it.stableId == sibling.stableId }
+                  .accessOrigin,
+              )
+            }
+            val first = checkNotNull(owner.signOut(endpoint.stableId))
+            try {
+              runCurrent()
+              val original = checkNotNull(owner.presentation.value.attention)
+              // Changing selection must not strand the still-registered presentation owner.
+              registry.setActive(sibling.stableId)
+              runCurrent()
+              assertTrue(original === owner.presentation.value.attention)
+              val failure =
+                if (newerFailure) {
+                  checkNotNull(owner.retry(owner.admissionCheckpoint()) { true }).reportFailure("Saved endpoint unavailable")
+                  checkNotNull(owner.presentation.value.attention)
+                } else {
+                  null
+                }
+              val second = checkNotNull(owner.signOut(sibling.stableId))
+              runCurrent()
+              val pending = checkNotNull(owner.presentation.value.attention)
+              if (failure != null) {
+                assertTrue(failure === pending)
+              } else {
+                assertEquals(if (ordinarySibling) endpoint.stableId else sibling.stableId, pending.stableId)
+                assertEquals("Signing out…", pending.message)
+                if (ordinarySibling) assertTrue(original === pending)
+              }
+              firstDrain.complete(Unit)
+              assertEquals(deleteSucceeds, runCatching { first.await() }.isSuccess)
+              runCurrent()
+              assertEquals(2, drainCount)
+              assertFalse(second.isCompleted)
+              assertTrue(pending === owner.presentation.value.attention)
+              secondDrain.complete(Unit)
+              assertEquals(deleteSucceeds, runCatching { second.await() }.isSuccess)
+              runCurrent()
+              assertEquals(if (deleteSucceeds) null else encoded, storage.values[application.origin])
+              if (failure != null) {
+                assertTrue(failure === owner.presentation.value.attention)
+              } else {
+                val completed = checkNotNull(owner.presentation.value.attention)
+                assertEquals(pending.stableId, completed.stableId)
+                assertTrue(completed.message.contains(if (deleteSucceeds) "is signed out" else "Try Sign out again"))
+              }
+              if (ordinarySibling) {
+                assertNull(owner.authorization(sibling))
+                assertFalse(owner.needsEmbeddedBrowserSignIn(sibling.stableId))
+                assertFalse(owner.blocksAutomaticReconnect(sibling.stableId))
+              }
+            } finally {
+              firstDrain.complete(Unit)
+              secondDrain.complete(Unit)
+            }
+          }
+        }
+      }
+    }
+
+  @Test fun pendingSignOutCannotAdoptAReplacementRegistrationDuringItsRawProbe() =
+    runTest {
+      for (deleteSucceeds in listOf(false, true)) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "ordinary-sign-out-sibling")
+        add(registry, sibling)
+        registry.setAccessOrigin(sibling.stableId, application.origin)
+        val storage = Storage().also { it.deleteSucceeds = deleteSucceeds }
+        storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
+        val drain = CompletableDeferred<Unit>()
+        val probe = CompletableDeferred<Unit>()
+        var entered = false
+        val replacement = endpoint.copy(contextPath = "/replacement/socket")
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { target, _ ->
+            client { request ->
+              if (target == replacement) {
+                entered = true
+                probe.await()
+                throw java.io.IOException("test-only replacement probe failure")
+              }
+              target.stableId != sibling.stableId && request.header("Cf-Access-Token") == null
+            }
+          })
+        assertNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+        assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
+        val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+        var preparing: Deferred<Result<GatewayIngressAuthorization?>>? = null
+        try {
+          runCurrent()
+          assertEquals("Signing out…", checkNotNull(owner.presentation.value.attention).message)
+          preparing = async { runCatching { owner.prepare(replacement, tls, false, owner.admissionCheckpoint()) { true } } }
+          runCurrent()
+          assertTrue(entered)
+          assertFalse(preparing.isCompleted)
+          assertNull(owner.presentation.value.attention)
+          val siblingStop = checkNotNull(owner.signOut(sibling.stableId))
+          assertNull(owner.presentation.value.attention)
+          drain.complete(Unit)
+          assertEquals(deleteSucceeds, runCatching { stopped.await() }.isSuccess)
+          assertEquals(deleteSucceeds, runCatching { siblingStop.await() }.isSuccess)
+          runCurrent()
+          assertNull(owner.presentation.value.attention)
+          probe.complete(Unit)
+          assertTrue(preparing.await().isFailure)
+          assertNull(owner.presentation.value.attention)
+        } finally {
+          drain.complete(Unit)
+          probe.complete(Unit)
+          preparing?.cancel()
+        }
+      }
+    }
+
+  @Test fun pendingSignOutClearsWhenItsProfileLosesManagedOwnership() =
+    runTest {
+      for (change in listOf("forget", "ordinary", "association")) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "retained-origin-sibling")
+        add(registry, sibling)
+        registry.setAccessOrigin(sibling.stableId, application.origin)
+        val storage = Storage()
+        storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
+        val drain = CompletableDeferred<Unit>()
+        var ordinary = false
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ ->
+            client { !ordinary && it.header("Cf-Access-Token") == null }
+          })
+        assertNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+        val stopped = checkNotNull(owner.signOut(endpoint.stableId))
+        try {
+          runCurrent()
+          assertEquals("Signing out…", checkNotNull(owner.presentation.value.attention).message)
+          when (change) {
+            "forget" -> {
+              owner.forget(endpoint.stableId)
+            }
+
+            "ordinary" -> {
+              ordinary = true
+              assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+            }
+
+            "association" -> {
+              registry.setAccessOrigin(endpoint.stableId, CloudflareAccessOrigin.from("https://replacement.example.test"))
+            }
+          }
+          runCurrent()
+          assertNull(owner.presentation.value.attention)
+          drain.complete(Unit)
+          stopped.await()
+          runCurrent()
+          assertNull(owner.presentation.value.attention)
+          assertNull(storage.values[application.origin])
+        } finally {
+          drain.complete(Unit)
+        }
+      }
+    }
+
   @Test fun signOutRevokesBeforeItsAttentionCollectorCanFinishCachedAdmission() =
     runTest {
       val storage = Storage()
@@ -297,12 +557,12 @@ class GatewayIngressControllerTest {
       assertFalse(pending.isCompleted)
       backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
         owner.presentation.collect { presentation ->
-          if (presentation.attention?.message?.contains("signed out") == true) release.complete(Unit)
+          if (presentation.attention?.message == "Signing out…") release.complete(Unit)
         }
       }
       val stopped = checkNotNull(owner.signOut(endpoint.stableId))
       assertTrue(pending.await().exceptionOrNull() is CancellationException)
-      assertTrue(checkNotNull(owner.presentation.value.attention).message.contains("signed out"))
+      assertEquals("Signing out…", checkNotNull(owner.presentation.value.attention).message)
       assertTrue(runCatching { old.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build()) }.exceptionOrNull() is GatewayExternalAuthorizationException)
       retirement.complete(Unit)
       stopped.await()
@@ -1087,6 +1347,7 @@ class GatewayIngressControllerTest {
         assertTrue(observed)
         assertTrue(result.exceptionOrNull() is CancellationException)
         assertNull(owner.presentation.value.browserLaunch)
+        runCurrent()
         if (forget) assertNull(owner.presentation.value.attention) else assertTrue(checkNotNull(owner.presentation.value.attention).message.contains("signed out"))
         observer.cancel()
       }
@@ -1435,10 +1696,13 @@ class GatewayIngressControllerTest {
           )
           if (scenario == "repeat-sign-out") {
             checkNotNull(owner.signOut(endpoint.stableId)).await()
+            runCurrent()
             val queued = checkNotNull(owner.retry(owner.admissionCheckpoint()) { true })
-            val signedOut = owner.presentation.value
+            val previousSignedOut = owner.presentation.value
             checkNotNull(owner.signOut(endpoint.stableId)).await()
-            assertTrue(signedOut === owner.presentation.value)
+            runCurrent()
+            val signedOut = owner.presentation.value
+            assertEquals(previousSignedOut, signedOut)
             val stale = runCatching { queued.prepare(replacement, tls) }
             assertTrue(stale.exceptionOrNull() is CancellationException)
             assertTrue(signedOut === owner.presentation.value)
