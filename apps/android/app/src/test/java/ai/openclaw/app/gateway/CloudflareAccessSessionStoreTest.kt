@@ -301,7 +301,10 @@ class CloudflareAccessSessionStoreTest {
       val dispatches = LinkedBlockingQueue<Runnable>()
       val dispatcher =
         object : CoroutineDispatcher() {
-          override fun dispatch(context: CoroutineContext, block: Runnable) {
+          override fun dispatch(
+            context: CoroutineContext,
+            block: Runnable,
+          ) {
             dispatches.add(block)
           }
         }
