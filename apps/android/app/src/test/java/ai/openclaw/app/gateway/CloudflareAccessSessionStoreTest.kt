@@ -321,10 +321,11 @@ class CloudflareAccessSessionStoreTest {
       val checkpoint = store.admissionCheckpoint()
       val cancelled = store.signIn(application) {}
       val cancelledDispatch = checkNotNull(dispatches.poll(1, TimeUnit.SECONDS))
-      val completion = Thread {
-        cancelled.cancel()
-        cancelledDispatch.run()
-      }
+      val completion =
+        Thread {
+          cancelled.cancel()
+          cancelledDispatch.run()
+        }
       try {
         val fresh =
           store.withCurrentSnapshot(application.origin, previous.revision, checkpoint) {
