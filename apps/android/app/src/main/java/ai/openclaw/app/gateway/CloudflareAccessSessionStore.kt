@@ -130,10 +130,16 @@ internal class CloudflareAccessSessionStore(
         val origin = application.origin
         requireAdmission(origin, admissionCheckpoint)
         attempts[origin]?.let {
-          if (it.application == application) return@synchronized it.task
-          // Publish the replacement before cancellation can reenter this owner.
-          superseded = it.task
-          attempts.remove(origin)
+          // A failed Deferred can be observable before its completion handler takes
+          // this monitor. Retry must replace it, not coalesce onto a terminal failure.
+          if (!it.task.isCompleted) {
+            if (it.application == application) return@synchronized it.task
+            // Publish the replacement before cancellation can reenter this owner.
+            superseded = it.task
+            attempts.remove(origin)
+          } else {
+            completeFailedAttempt(origin, it.id)
+          }
         }
         val id = UUID.randomUUID()
         val task =
@@ -165,21 +171,19 @@ internal class CloudflareAccessSessionStore(
                 snapshot
               }
             } catch (error: Exception) {
-              synchronized(lock) {
-                if (attempts[origin]?.id == id) {
-                  attempts.remove(origin)
-                  setState(origin, State.ReauthenticationRequired)
-                }
-              }
+              completeFailedAttempt(origin, id)
               throw error
             }
           }
         attempts[origin] = Attempt(id, application, task)
         setState(origin, State.SigningIn)
+        // Register after publication: an already-cancelled scope invokes this immediately.
+        // This fallback covers cancellation that skips the body and its earlier cleanup.
+        task.invokeOnCompletion { error -> if (error != null) completeFailedAttempt(origin, id) }
         task
       }
-    // Unconfined starts and cancellation handlers can run inline. Never execute
-    // them while holding the state monitor or a consumer publication lock.
+    // Unconfined authentication and cancellation handlers may reenter ingress.
+    // Cancel and start after releasing the state monitor and any consumer publication lock.
     superseded?.cancel()
     task.start()
     return task
@@ -265,6 +269,18 @@ internal class CloudflareAccessSessionStore(
     val retirement = Retirement(id, origin, lifecycle.getValue(origin).transitionRevision, task, supersededAttempt)
     retirements[origin] = retirement
     return retirement
+  }
+
+  private fun completeFailedAttempt(
+    origin: CloudflareAccessOrigin,
+    id: UUID,
+  ) {
+    synchronized(lock) {
+      if (attempts[origin]?.id == id) {
+        attempts.remove(origin)
+        setState(origin, State.ReauthenticationRequired)
+      }
+    }
   }
 
   private fun checkAttempt(
