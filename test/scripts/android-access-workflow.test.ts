@@ -2,6 +2,10 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
+import {
+  selectAndroidAccessTests,
+  verifyAndroidAccessReports,
+} from "../helpers/android-access-workflow.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const workflow = parse(readFileSync(".github/workflows/ci.yml", "utf8"));
@@ -12,50 +16,13 @@ const step = job.steps.find(
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function verifyReports(mode: string) {
-  const root = tempDirs.make("openclaw-access-reports-");
-  const verification = step.run.split("python3 - <<'PY'\n")[1]?.split("\nPY")[0];
-  if (!verification) {
-    throw new Error("Missing native report verification");
-  }
-  return spawnSync(
-    "python3",
-    [
-      "-c",
-      String.raw`
-from pathlib import Path
-import json, os, sys, zipfile
-mode = sys.argv[1]
-reports = Path('apps/android/app/build/outputs/androidTest-results/connected/debug')
-reports.mkdir(parents=True)
-names = os.environ['ACCESS_NATIVE_TEST_CLASSES'].split(',')
-if mode == 'wrong-class': names[0] = 'OtherTest'
-if mode == 'missing-store': names = names[:1]
-if mode == 'duplicate': names.append(names[0])
-child = '<failure/>' if mode == 'failed' else '<error/>' if mode == 'error' else '<skipped/>' if mode == 'skipped' else ''
-cases = '' if mode == 'empty' else ''.join(f'<testcase classname="{name}" name="native">{child}</testcase>' for name in names)
-(reports / 'TEST-device.xml').write_text(f'<testsuite>{cases}</testsuite>')
-apk = Path('apps/android/app/build/outputs/apk/play/debug/openclaw-2099.1.2-play-debug.apk')
-apk.parent.mkdir(parents=True)
-element = {'outputFile': '../outside.apk' if mode == 'outside-output' else apk.name, 'filters': []}
-metadata = {'variantName': 'thirdPartyDebug' if mode == 'wrong-variant' else 'playDebug',
-            'artifactType': {'type': 'APK'}, 'elements': [element, element] if mode == 'ambiguous-output' else [element]}
-(apk.parent / 'output-metadata.json').write_text(json.dumps(metadata))
-abis = ['armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64']
-if mode == 'missing-abi': abis.pop()
-with zipfile.ZipFile(apk, 'w') as archive:
-    for abi in abis: archive.writestr(f'lib/{abi}/libsodium.so', b'test-only')
-` + verification,
-      mode,
-    ],
-    {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        ACCESS_NATIVE_TEST_CLASSES:
-          "ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest",
-      },
-    },
+  const selection = selectAndroidAccessTests(step.run, { RUN_ACCESS_PERSISTENCE: "true" });
+  expect(selection.status, selection.stderr).toBe(0);
+  return verifyAndroidAccessReports(
+    tempDirs.make("openclaw-access-reports-"),
+    step.run,
+    mode,
+    selection.stdout.trim().split("\n")[0] ?? "",
   );
 }
 
@@ -69,8 +36,11 @@ describe("Android Access native workflow", () => {
     expect(job.if).toBe("needs.preflight.outputs.run_android_access_native == 'true'");
     expect(step.run).toContain(":app:connectedPlayDebugAndroidTest");
     expect(step.run).toContain('"$native_test_filter"');
-    expect(step.run).toContain(
-      "export ACCESS_NATIVE_TEST_CLASSES=ai.openclaw.app.gateway.CloudflareAccessNativeTest,ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest",
+    expect(workflow.jobs.preflight.outputs.run_android_access_persistence).toBe(
+      "${{ steps.manifest.outputs.run_android_access_persistence }}",
+    );
+    expect(step.env.RUN_ACCESS_PERSISTENCE).toBe(
+      "${{ needs.preflight.outputs.run_android_access_persistence }}",
     );
     expect(step.run).toContain('zipalign" -c -P 16 -v 4');
     expect(step.run).toContain('zipalign" -c -P 16 -v 4 "$apk"');
@@ -80,35 +50,38 @@ describe("Android Access native workflow", () => {
     );
   });
 
-  it("selects both Debug methods through AGP's comma-separated arguments and adb shell quoting", () => {
-    const assignment = step.run
-      .split("\n")
-      .find((line: string) => line.startsWith("native_test_filter="));
-    expect(assignment).toBeDefined();
-    const result = spawnSync("bash", ["-c", `${assignment}\nprintf '%s' "$native_test_filter"`], {
-      encoding: "utf8",
-    });
-    expect(result.status, result.stderr).toBe(0);
-    const prefix = "-Pandroid.testInstrumentationRunnerArguments.tests_regex=";
-    expect(result.stdout.startsWith(prefix)).toBe(true);
-    const value = result.stdout.slice(prefix.length);
-    expect(value).not.toContain(",");
-    expect(value.startsWith("'") && value.endsWith("'")).toBe(true);
-    const remote = spawnSync("bash", ["-c", `printf '%s' ${value}`], { encoding: "utf8" });
-    expect(remote.status, remote.stderr).toBe(0);
-    expect(remote.stdout.startsWith("^") && remote.stdout.endsWith("$")).toBe(true);
-    const selection = new RegExp(remote.stdout);
-    const methods = [
-      "ai.openclaw.app.gateway.CloudflareAccessNativeTest#packagedSodiumLoadsAndDecryptsTheGoTransferVector",
-      "ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest#encryptedGrantRestoresAndDeletesWithoutChangingGatewayPairing",
-    ];
-    for (const method of methods) {
-      expect(selection.test(method)).toBe(true);
-      expect(selection.test(`other.${method}`)).toBe(false);
-      expect(selection.test(`${method}Extra`)).toBe(false);
-      expect(selection.test(method.replace(/#.+$/, "#otherMethod"))).toBe(false);
-    }
-  });
+  it.each([false, true])(
+    "selects supported Debug methods with adb quoting (persistence=%s)",
+    (persistence) => {
+      const result = selectAndroidAccessTests(step.run, {
+        RUN_ACCESS_PERSISTENCE: String(persistence),
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const [classes = "", filter = ""] = result.stdout.trim().split("\n");
+      const prefix = "-Pandroid.testInstrumentationRunnerArguments.tests_regex=";
+      expect(filter.startsWith(prefix)).toBe(true);
+      const value = filter.slice(prefix.length);
+      expect(value).not.toContain(",");
+      expect(value.startsWith("'") && value.endsWith("'")).toBe(true);
+      const remote = spawnSync("bash", ["-c", `printf '%s' ${value}`], { encoding: "utf8" });
+      expect(remote.status, remote.stderr).toBe(0);
+      expect(remote.stdout.startsWith("^") && remote.stdout.endsWith("$")).toBe(true);
+      const selection = new RegExp(remote.stdout);
+      const methods = [
+        "ai.openclaw.app.gateway.CloudflareAccessNativeTest#packagedSodiumLoadsAndDecryptsTheGoTransferVector",
+        "ai.openclaw.app.gateway.CloudflareAccessPersistenceNativeTest#encryptedGrantRestoresAndDeletesWithoutChangingGatewayPairing",
+      ];
+      expect(classes.split(",")).toEqual(
+        methods.slice(0, persistence ? 2 : 1).map((method) => method.split("#")[0]),
+      );
+      for (const [index, method] of methods.entries()) {
+        expect(selection.test(method)).toBe(index === 0 || persistence);
+        expect(selection.test(`other.${method}`)).toBe(false);
+        expect(selection.test(`${method}Extra`)).toBe(false);
+        expect(selection.test(method.replace(/#.+$/, "#otherMethod"))).toBe(false);
+      }
+    },
+  );
 
   it("requires ordinary and strict simulated 16 KiB packaged execution", () => {
     expect(job.strategy).toEqual({
@@ -143,6 +116,7 @@ describe("Android Access native workflow", () => {
           "-c",
           `set -euo pipefail
 EXPECTED_PAGE_SIZE=16384
+RUN_ACCESS_PERSISTENCE=true
 adb() {
   case "$*" in
     *"getconf PAGE_SIZE") echo ${pageSize} ;;
