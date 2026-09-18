@@ -17,8 +17,10 @@ import okhttp3.CookieJar
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SSLException
 
 internal data class GatewayAccessAttention(
   val stableId: String,
@@ -130,7 +132,14 @@ internal class GatewayIngressController(
     admissionCheckpoint: Long,
     isCurrent: () -> Boolean,
   ): GatewayIngressAuthorization? {
-    if (tls == null) return null
+    kotlin.coroutines.coroutineContext.ensureActive()
+    if (tls == null) {
+      forget(endpoint.stableId) {
+        if (!isCurrent()) throw CancellationException("Gateway request superseded")
+      }
+      checkCleartextAdmission(endpoint.stableId, isCurrent)
+      return null
+    }
     return prepareRegistered(register(endpoint, tls, isCurrent), userInitiated, admissionCheckpoint, isCurrent)
   }
 
@@ -140,8 +149,10 @@ internal class GatewayIngressController(
     isCurrent: () -> Boolean,
     bind: (Registration) -> Unit = {},
   ): Registration {
+    val context = kotlin.coroutines.coroutineContext
     val (registration, replacedIntent) =
       synchronized(lock) {
+        context.ensureActive()
         if (!isCurrent() || registry.entries.value.none { it.stableId == endpoint.stableId }) {
           throw CancellationException("Gateway request superseded")
         }
@@ -387,32 +398,65 @@ internal class GatewayIngressController(
     cancel(id)
   }
 
-  suspend fun forget(stableId: String) {
-    val (origin, intent, task) =
+  suspend fun forget(stableId: String) = forget(stableId) {}
+
+  private suspend fun forget(
+    stableId: String,
+    validate: () -> Unit,
+  ) {
+    val context = kotlin.coroutines.coroutineContext
+    var associationFailed = false
+    val (intent, retirement, association) =
       synchronized(lock) {
+        context.ensureActive()
+        validate()
         val intent = browserIntent?.takeIf { it.registration.endpoint.stableId == stableId }
-        val task = intent?.task
-        // A StateFlow publication may resume the committed waiter inline. Retire
-        // its identity before removing registration or publishing the cleared UI.
+        val registration = registrations[stableId]
+        val association =
+          registry.entries.value
+            .firstOrNull { it.stableId == stableId }
+            ?.accessOrigin
+        val origin = association?.let { runCatching { CloudflareAccessOrigin.from(it) }.getOrNull() } ?: registration?.origin
+        // Reserve last-owner retirement before any observable publication. Shared
+        // departures release their association now, leaving the final owner durable.
+        val retirement =
+          origin
+            ?.takeIf { selected -> registry.entries.value.none { it.stableId != stableId && it.accessOrigin == selected.uri.toString() } }
+            ?.let(store::reserveForget)
         intent?.canceled?.set(true)
         leases.remove(stableId)?.active?.set(false)
-        val registration = registrations.remove(stableId)
-        // The saved association was committed before any grant. An interrupted
-        // route replacement may already have a different in-flight registration.
-        val origin =
-          registry.entries.value.firstOrNull { it.stableId == stableId }?.accessOrigin?.let {
-            runCatching { CloudflareAccessOrigin.from(it) }.getOrNull()
-          } ?: registration?.origin
-        publishLocked(
-          attention = mutablePresentation.value.attention.takeUnless { it?.stableId == stableId },
-          browserLaunch = mutablePresentation.value.browserLaunch.takeUnless { intent != null && it?.attemptId == intent.id },
-        )
-        Triple(origin, intent, task)
+        registrations.remove(stableId)
+        if (retirement == null && association != null) {
+          associationFailed = !registry.setAccessOrigin(stableId, null)
+        }
+        // Registry observers can reenter after the association commit. A newer
+        // registration owns its UI even when it uses the same origin.
+        if (registrations[stableId] == null) {
+          publishLocked(
+            attention = mutablePresentation.value.attention.takeUnless { it?.stableId == stableId },
+            browserLaunch = mutablePresentation.value.browserLaunch.takeUnless { intent != null && it?.attemptId == intent.id },
+          )
+        }
+        Triple(intent, retirement, association)
       }
-    val cancellation = intent?.let { finishCancellation(it, task) }
-    val retirement = if (origin != null && registry.entries.value.none { it.stableId != stableId && it.accessOrigin == origin.uri.toString() }) store.forget(origin) else null
+    retirement?.start()
+    val cancellation = intent?.let { finishCancellation(it, it.task) }
     cancellation?.join()
     retirement?.task?.await()
+    context.ensureActive()
+    synchronized(lock) {
+      if (registrations[stableId] != null ||
+        registry.entries.value
+          .firstOrNull { it.stableId == stableId }
+          ?.accessOrigin != association ||
+        (retirement != null && !store.isCurrent(retirement))
+      ) {
+        return
+      }
+      if (associationFailed || (association != null && !registry.setAccessOrigin(stableId, null))) {
+        throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
+      }
+    }
   }
 
   fun revalidate() {
@@ -449,21 +493,30 @@ internal class GatewayIngressController(
       endpoint: GatewayEndpoint,
       tls: GatewayTlsParams?,
     ): GatewayIngressAuthorization? {
-      if (tls == null) return null
+      kotlin.coroutines.coroutineContext.ensureActive()
       require(endpoint.stableId == stableId)
+      if (tls == null) {
+        forget(stableId, ::checkOwnerLocked)
+        checkCleartextAdmission(stableId, isCurrent)
+        return null
+      }
       val prepared =
         register(endpoint, tls, isCurrent) { selected ->
-          if (!ownsPresentationLocked() ||
-            !callerIsCurrent {
-              ownedOrigin()?.let { store.requireAdmission(it, admissionCheckpoint) }
-              isCurrent()
-            }
-          ) {
-            throw CancellationException("Gateway retry superseded")
-          }
+          checkOwnerLocked()
           owner = RetryOwner.Acquired(selected)
         }
       return prepareRegistered(prepared, true, admissionCheckpoint, isCurrent)
+    }
+
+    private fun checkOwnerLocked() {
+      if (!ownsPresentationLocked() ||
+        !callerIsCurrent {
+          ownedOrigin()?.let { store.requireAdmission(it, admissionCheckpoint) }
+          isCurrent()
+        }
+      ) {
+        throw CancellationException("Gateway retry superseded")
+      }
     }
 
     private fun ownsPresentationLocked(): Boolean =
@@ -600,7 +653,12 @@ internal class GatewayIngressController(
             attention =
               GatewayAccessAttention(
                 intent.registration.endpoint.stableId,
-                (error as? CloudflareAccessException)?.message ?: "Sign-in canceled. Sign in again to reconnect.",
+                when (error) {
+                  is CancellationException -> "Sign-in canceled. Sign in again to reconnect."
+                  is SSLException -> "TLS connection failed: ${error.message ?: "certificate validation failed"}"
+                  is IOException -> "Connection failed: ${error.message ?: "network unavailable"}"
+                  else -> error.message ?: "Sign-in failed. Try again."
+                },
               ),
             browserLaunch = null,
           )
@@ -805,6 +863,18 @@ internal class GatewayIngressController(
     } catch (_: CancellationException) {
       false
     }
+
+  private suspend fun checkCleartextAdmission(
+    stableId: String,
+    isCurrent: () -> Boolean,
+  ) {
+    kotlin.coroutines.coroutineContext.ensureActive()
+    synchronized(lock) {
+      // Forget can skip superseded cleanup. Admission still belongs to this caller
+      // and profile, independently of another profile's origin-wide retirement.
+      if (!isCurrent() || registrations[stableId] != null) throw CancellationException("Gateway request superseded")
+    }
+  }
 
   private suspend fun checkRegistration(
     registration: Registration,
