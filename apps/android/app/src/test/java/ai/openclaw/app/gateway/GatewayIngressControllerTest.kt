@@ -110,6 +110,16 @@ class GatewayIngressControllerTest {
     registry.upsert(GatewayRegistryEntry(target.stableId, GatewayRegistryEntryKind.MANUAL, target.name, target.host, target.port, contextPath = target.contextPath))
   }
 
+  private fun assertTlsFailure(
+    expected: SSLHandshakeException,
+    actual: Throwable?,
+  ) {
+    assertTrue(actual is SSLHandshakeException)
+    assertEquals(expected.message, actual?.message)
+    // Coroutine stacktrace recovery may copy the failure while retaining its cause.
+    assertTrue(generateSequence(actual) { it.cause }.any { it === expected })
+  }
+
   private fun client(probe: suspend (Request) -> Boolean = { it.header("Cf-Access-Token") == null }): CloudflareAccessClient =
     CloudflareAccessClient { request, _, _ ->
       when {
@@ -2647,35 +2657,111 @@ class GatewayIngressControllerTest {
   @Test fun cancelingEitherCoalescedWaiterLeavesThePeerAndBrowserOwnerIntact() =
     runTest {
       for (canceledIndex in listOf(0, 1)) {
-        val registry = registry()
-        val sibling = endpoint.copy(stableId = "coalesced-sibling")
-        add(registry, sibling)
-        val storage = Storage()
-        val grant = CompletableDeferred<CloudflareAccessSession>()
-        var prompts = 0
-        val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
-            prompts++
-            open("https://example.cloudflareaccess.com/login")
-            grant.await()
-          })
-        val first = async { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } }
+        for (retirement in listOf("job", "caller", "both")) {
+          for (succeeds in listOf(false, true)) {
+            val registry = registry()
+            val sibling = endpoint.copy(stableId = "coalesced-sibling")
+            add(registry, sibling)
+            val storage = Storage()
+            val grant = CompletableDeferred<CloudflareAccessSession>()
+            val current = mutableListOf(true, true)
+            val failure = SSLHandshakeException("test-only shared TLS failure")
+            var prompts = 0
+            val owner =
+              GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+                prompts++
+                open("https://example.cloudflareaccess.com/login")
+                grant.await()
+              })
+            val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { current[0] } } }
+            runCurrent()
+            val launch = owner.presentation.value.browserLaunch
+            val second = async { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { current[1] } } }
+            runCurrent()
+            val callers = listOf(first, second)
+            if (retirement != "job") current[canceledIndex] = false
+            if (retirement != "caller") callers[canceledIndex].cancel()
+            runCurrent()
+            assertEquals(launch, owner.presentation.value.browserLaunch)
+            assertEquals(1, prompts)
+            if (succeeds) grant.complete(CloudflareAccessTestTokens.session()) else grant.completeExceptionally(failure)
+            val retiredError = runCatching { callers[canceledIndex].await().getOrThrow() }.exceptionOrNull()
+            if (!succeeds && retiredError !is CancellationException) {
+              assertTlsFailure(failure, retiredError)
+            } else {
+              assertTrue(retiredError is CancellationException)
+            }
+            val peer = callers[1 - canceledIndex].await()
+            if (succeeds) {
+              val lease = checkNotNull(peer.getOrThrow())
+              lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+              assertNotNull(storage.values[application.origin])
+              assertNull(owner.presentation.value.attention)
+            } else {
+              assertTlsFailure(failure, peer.exceptionOrNull())
+              assertNull(storage.values[application.origin])
+              val attention = checkNotNull(owner.presentation.value.attention)
+              assertEquals(if (canceledIndex == 0) sibling.stableId else endpoint.stableId, attention.stableId)
+              assertTrue(attention.message.startsWith("TLS connection failed:"))
+              assertNotNull(owner.retry(owner.admissionCheckpoint()) { true })
+            }
+            assertNull(owner.presentation.value.browserLaunch)
+            assertFalse(owner.blocksAutomaticReconnect(if (canceledIndex == 0) endpoint.stableId else sibling.stableId))
+          }
+        }
+      }
+    }
+
+  @Test fun delayedCoalescedWaitersCannotSettleAReplacementBrowserIntent() =
+    runTest {
+      val registry = registry()
+      val sibling = endpoint.copy(stableId = "coalesced-sibling")
+      val replacement = endpoint.copy(stableId = "replacement-browser")
+      add(registry, sibling)
+      add(registry, replacement)
+      val firstGrant = CompletableDeferred<CloudflareAccessSession>()
+      val replacementGrant = CompletableDeferred<CloudflareAccessSession>()
+      val paused = PausingDispatcher(StandardTestDispatcher(testScheduler))
+      val failure = SSLHandshakeException("test-only completed shared failure")
+      var prompts = 0
+      val owner =
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          val grant = if (++prompts == 1) firstGrant else replacementGrant
+          open("https://example.cloudflareaccess.com/login")
+          grant.await()
+        })
+      val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }
+      runCurrent()
+      val second = async(paused) { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } } }
+      runCurrent()
+      var fresh: Job? = null
+      try {
+        paused.paused = true
+        firstGrant.completeExceptionally(failure)
         runCurrent()
-        val launch = owner.presentation.value.browserLaunch
-        val second = async { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } }
+        assertTlsFailure(failure, first.await().exceptionOrNull())
+        assertNull(owner.presentation.value.browserLaunch)
+        assertFalse(second.isCompleted)
+        val replacementWaiter = async { owner.prepare(replacement, tls.copy(stableId = replacement.stableId), true, owner.admissionCheckpoint()) { true } }
+        fresh = replacementWaiter
         runCurrent()
-        val callers = listOf(first, second)
-        callers[canceledIndex].cancel()
+        val presentation = owner.presentation.value
+        assertNotNull(presentation.browserLaunch)
+        assertEquals(replacement.stableId, presentation.attention?.stableId)
+        assertEquals(2, prompts)
+        paused.resume()
         runCurrent()
-        assertEquals(launch, owner.presentation.value.browserLaunch)
-        assertEquals(1, prompts)
-        grant.complete(CloudflareAccessTestTokens.session())
-        assertTrue(runCatching { callers[canceledIndex].await() }.exceptionOrNull() is CancellationException)
-        val lease = checkNotNull(callers[1 - canceledIndex].await())
-        lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
-        assertNotNull(storage.values[application.origin])
+        assertTlsFailure(failure, second.await().exceptionOrNull())
+        assertEquals(presentation, owner.presentation.value)
+        replacementGrant.complete(CloudflareAccessTestTokens.session())
+        assertNotNull(replacementWaiter.await())
         assertNull(owner.presentation.value.browserLaunch)
         assertNull(owner.presentation.value.attention)
+      } finally {
+        paused.resume()
+        first.cancelAndJoin()
+        second.cancelAndJoin()
+        fresh?.cancelAndJoin()
       }
     }
 
@@ -2720,7 +2806,7 @@ class GatewayIngressControllerTest {
           throw failure
         })
       val error = runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } }.exceptionOrNull()
-      assertSame(failure, error)
+      assertTlsFailure(failure, error)
       assertTrue(checkNotNull(owner.presentation.value.attention).message.startsWith("TLS connection failed:"))
       assertFalse(checkNotNull(owner.presentation.value.attention).message.contains("canceled"))
       assertNull(owner.presentation.value.browserLaunch)

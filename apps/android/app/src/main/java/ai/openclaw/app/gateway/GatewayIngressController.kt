@@ -624,10 +624,13 @@ internal class GatewayIngressController(
       }
     try {
       val result = task.await()
+      kotlin.coroutines.coroutineContext.ensureActive()
       synchronized(lock) {
         checkRegistrationLocked(registration, isCurrent)
         if (intent.canceled.get()) throw CancellationException("Gateway sign-in canceled")
-        if (isLiveIntentLocked(intent)) {
+        // Completion belongs to the shared intent; any current waiter can settle it
+        // even after the caller that originally presented its browser has retired.
+        if (browserIntent === intent) {
           browserIntent = null
           publishLocked(attention = null, browserLaunch = null)
         }
@@ -645,14 +648,14 @@ internal class GatewayIngressController(
           }
         // A shared task's retired waiter cannot clear the surviving browser owner
         // or publish a retry action for a forgotten/replaced profile.
-        if (isLiveIntentLocked(intent) && task.isCompleted && callerCurrent &&
+        if (browserIntent === intent && !intent.canceled.get() && task.isCompleted && callerCurrent &&
           isRegisteredLocked(registration)
         ) {
           browserIntent = null
           publishLocked(
             attention =
               GatewayAccessAttention(
-                intent.registration.endpoint.stableId,
+                registration.endpoint.stableId,
                 when (error) {
                   is CancellationException -> "Sign-in canceled. Sign in again to reconnect."
                   is SSLException -> "TLS connection failed: ${error.message ?: "certificate validation failed"}"
