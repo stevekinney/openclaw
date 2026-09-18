@@ -221,23 +221,13 @@ internal class GatewayIngressController(
           previous?.let { store.reserveForget(CloudflareAccessOrigin.from(it)) }
         }
       }
-    if (previousRetirement != null) {
-      previousRetirement.start()
-      previousRetirement.task.await()
-      checkRegistration(registration, isCurrent)
-      synchronized(lock) {
+    if (previousRetirement != null &&
+      !completeDeparture(endpoint.stableId, previousRetirement.origin.uri.toString(), previousRetirement) {
         checkRegistrationLocked(registration, isCurrent)
-        if (registry.entries.value
-            .firstOrNull { it.stableId == endpoint.stableId }
-            ?.accessOrigin != previousRetirement.origin.uri.toString()
-        ) {
-          throw CancellationException("Gateway association superseded")
-        }
-        if (!registry.setAccessOrigin(endpoint.stableId, null)) {
-          throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
-        }
-        publishLocked()
+        true
       }
+    ) {
+      throw CancellationException("Gateway association superseded")
     }
     // Existing service headers or WARP must remain independent of a cached browser
     // grant. Only a verified Access challenge admits managed credentials for this profile.
@@ -442,19 +432,62 @@ internal class GatewayIngressController(
     retirement?.start()
     val cancellation = intent?.let { finishCancellation(it, it.task) }
     cancellation?.join()
-    retirement?.task?.await()
-    context.ensureActive()
-    synchronized(lock) {
-      if (registrations[stableId] != null ||
-        registry.entries.value
-          .firstOrNull { it.stableId == stableId }
-          ?.accessOrigin != association ||
-        (retirement != null && !store.isCurrent(retirement))
-      ) {
-        return
+    if (retirement != null) {
+      completeDeparture(stableId, association, retirement) { registrations[stableId] == null }
+    } else {
+      context.ensureActive()
+      synchronized(lock) {
+        if (associationFailed && registrations[stableId] == null &&
+          registry.entries.value
+            .firstOrNull { it.stableId == stableId }
+            ?.accessOrigin == association
+        ) {
+          throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
+        }
       }
-      if (associationFailed || (association != null && !registry.setAccessOrigin(stableId, null))) {
-        throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
+    }
+  }
+
+  private suspend fun completeDeparture(
+    stableId: String,
+    association: String?,
+    initialRetirement: CloudflareAccessSessionStore.Retirement,
+    ownsProfileLocked: () -> Boolean,
+  ): Boolean {
+    val context = kotlin.coroutines.coroutineContext
+    var retirement = initialRetirement
+    while (true) {
+      retirement.start()
+      retirement.task.await()
+      context.ensureActive()
+      synchronized(lock) {
+        if (!ownsProfileLocked() || registry.entries.value
+            .firstOrNull { it.stableId == stableId }
+            ?.accessOrigin != association
+        ) {
+          return false
+        }
+        val clearAssociation = {
+          if (association != null && !registry.setAccessOrigin(stableId, null)) {
+            throw CloudflareAccessException(CloudflareAccessException.Kind.StorageFailed)
+          }
+        }
+        // A peer may renew while this caller waits after deletion. Keep its grant
+        // if it still owns the origin; otherwise retire the renewed last-owner grant
+        // before releasing the durable association that makes cleanup recoverable.
+        val hasSibling = registry.entries.value.any { it.stableId != stableId && it.accessOrigin == retirement.origin.uri.toString() }
+        val completed =
+          if (hasSibling) {
+            clearAssociation()
+            true
+          } else {
+            store.withCurrentRetirement(retirement, clearAssociation)
+          }
+        if (completed) {
+          // Registry publication may synchronously install a replacement owner.
+          return ownsProfileLocked().also { if (it) publishLocked() }
+        }
+        retirement = store.reconcileForget(retirement.origin)
       }
     }
   }

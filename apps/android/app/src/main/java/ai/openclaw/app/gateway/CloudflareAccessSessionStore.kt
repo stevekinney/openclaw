@@ -66,6 +66,7 @@ internal class CloudflareAccessSessionStore(
     var state: State,
     var lastRevokedRevision: Long = 0,
     var transitionRevision: Long = 0,
+    var retirement: Retirement? = null,
   )
 
   private val lock = Any()
@@ -80,6 +81,18 @@ internal class CloudflareAccessSessionStore(
   fun state(origin: CloudflareAccessOrigin): State? = synchronized(lock) { lifecycle[origin]?.state }
 
   fun isCurrent(retirement: Retirement): Boolean = synchronized(lock) { lifecycle[retirement.origin]?.transitionRevision == retirement.transitionRevision }
+
+  fun withCurrentRetirement(
+    retirement: Retirement,
+    publish: () -> Unit,
+  ): Boolean =
+    synchronized(lock) {
+      if (!isCurrent(retirement)) return@synchronized false
+      // Like snapshot admission, last-owner release commits under ingress → Store
+      // ordering so a renewed grant cannot race the acknowledgement and publication.
+      publish()
+      true
+    }
 
   fun requireAdmission(
     origin: CloudflareAccessOrigin,
@@ -248,6 +261,13 @@ internal class CloudflareAccessSessionStore(
       queueRetirement(origin, attempt?.task)
     }
 
+  // Passive cleanup waiters share the latest explicit revocation, including its
+  // terminal failure. Only a later session transition requires another deletion.
+  fun reconcileForget(origin: CloudflareAccessOrigin): Retirement =
+    synchronized(lock) {
+      lifecycle[origin]?.takeIf { it.state == State.SignedOut }?.retirement ?: reserveForget(origin)
+    }
+
   private fun queueRetirement(
     origin: CloudflareAccessOrigin,
     supersededAttempt: Deferred<Snapshot>? = null,
@@ -268,6 +288,7 @@ internal class CloudflareAccessSessionStore(
       }
     val retirement = Retirement(id, origin, lifecycle.getValue(origin).transitionRevision, task, supersededAttempt)
     retirements[origin] = retirement
+    lifecycle.getValue(origin).retirement = retirement
     return retirement
   }
 
@@ -299,6 +320,7 @@ internal class CloudflareAccessSessionStore(
     // actions; another origin's activity must not hide its retirement failure.
     val current = lifecycle.getOrPut(origin) { Lifecycle(state) }
     current.state = state
+    current.retirement = null
     current.transitionRevision = ++revision
     return revision
   }
