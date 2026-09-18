@@ -2008,7 +2008,7 @@ class GatewayIngressControllerTest {
       }
     }
 
-  @Test fun sharedWaiterCannotPublishForRetiredProfileAndFailureBelongsToBrowserOwner() =
+  @Test fun sharedWaiterCannotPublishForRetiredProfileAndFailureBelongsToCurrentWaiter() =
     runTest {
       for (outcome in listOf("forget", "replace", "caller", "failure")) {
         val uncaught = mutableListOf<Throwable>()
@@ -2060,7 +2060,7 @@ class GatewayIngressControllerTest {
           if (outcome == "failure") {
             assertTrue(second.await().exceptionOrNull() is java.io.IOException)
             assertEquals(
-              endpoint.stableId,
+              sibling.stableId,
               owner.presentation.value.attention
                 ?.stableId,
             )
@@ -2074,7 +2074,7 @@ class GatewayIngressControllerTest {
           if (outcome == "failure") {
             assertTrue(first.await().exceptionOrNull() is java.io.IOException)
             assertEquals(
-              endpoint.stableId,
+              sibling.stableId,
               owner.presentation.value.attention
                 ?.stableId,
             )
