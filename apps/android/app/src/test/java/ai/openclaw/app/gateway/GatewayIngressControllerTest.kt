@@ -4833,7 +4833,7 @@ class GatewayIngressControllerTest {
             val failure = result.exceptionOrNull()
             if (failure !is SSLException) throw AssertionError("$mode: expected TLS rejection", failure)
             if (mode == "wrong-pin") {
-              assertTrue(generateSequence(failure) { it.cause }.any { it.message == "gateway TLS fingerprint mismatch" })
+              assertTrue(generateSequence<Throwable>(failure) { it.cause }.any { it.message == "gateway TLS fingerprint mismatch" })
             }
             assertEquals(0, server.requestCount)
           }
