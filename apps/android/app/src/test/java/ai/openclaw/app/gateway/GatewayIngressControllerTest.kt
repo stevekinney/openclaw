@@ -3566,6 +3566,100 @@ class GatewayIngressControllerTest {
       }
     }
 
+  @Test fun ordinaryProbeCannotOverwriteAnInterveningManagedPhaseOrGrant() =
+    runTest {
+      for (state in listOf("initial", "ordinary", "renewed", "same-grant")) {
+        val registry = registry()
+        val storage = Storage()
+        if (state == "renewed" || state == "same-grant") storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val grant = CompletableDeferred<CloudflareAccessSession>()
+        var ordinary = state == "ordinary"
+        var holdNextProbe = false
+        var rejectCached = false
+        var prompts = 0
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
+            client { request ->
+              if (request.header("Cf-Access-Token") == null) {
+                if (holdNextProbe) {
+                  holdNextProbe = false
+                  entered.complete(Unit)
+                  release.await()
+                  false
+                } else {
+                  !ordinary
+                }
+              } else {
+                rejectCached
+              }
+            }
+          }, authenticate = { _, open ->
+            prompts++
+            open("https://example.cloudflareaccess.com/login")
+            grant.await()
+          })
+        if (state != "initial") {
+          val initial = owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
+          assertEquals(state != "ordinary", initial != null)
+        }
+        holdNextProbe = true
+        val old = async { runCatching { owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true } } }
+        var managed: Deferred<GatewayIngressAuthorization?>? = null
+        try {
+          entered.await()
+          ordinary = false
+          rejectCached = state == "renewed"
+          val current = async { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } }
+          managed = current
+          runCurrent()
+          val browser = owner.presentation.value.browserLaunch
+          val attention = owner.presentation.value.attention
+          assertEquals(state != "same-grant", browser != null)
+          val request = Request.Builder().url(application.origin.uri.toString()).build()
+          var admitted: GatewayIngressAuthorization? = null
+          if (state == "renewed") {
+            val launch = checkNotNull(browser)
+            assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+            grant.complete(CloudflareAccessTestTokens.session("renewed-before-ordinary"))
+            admitted = checkNotNull(current.await())
+            admitted.requireCurrent(request)
+          } else if (state == "same-grant") {
+            admitted = checkNotNull(current.await())
+          }
+          release.complete(Unit)
+          if (state == "same-grant") {
+            assertNull(old.await().getOrThrow())
+            assertNull(owner.authorization(endpoint))
+            assertTrue(runCatching { checkNotNull(admitted).requireCurrent(request) }.isFailure)
+            assertEquals(0, prompts)
+          } else {
+            assertTrue(old.await().exceptionOrNull() is CancellationException)
+            if (state != "renewed") {
+              assertEquals(browser, owner.presentation.value.browserLaunch)
+              assertEquals(attention, owner.presentation.value.attention)
+              val launch = checkNotNull(browser)
+              assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+              grant.complete(CloudflareAccessTestTokens.session("managed-before-ordinary"))
+              admitted = checkNotNull(current.await())
+            }
+            checkNotNull(admitted).requireCurrent(request)
+            assertSame(admitted, owner.authorization(endpoint))
+            assertEquals(1, prompts)
+          }
+          assertNotNull(storage.values[application.origin])
+          assertNull(owner.presentation.value.browserLaunch)
+          assertNull(owner.presentation.value.attention)
+        } finally {
+          release.complete(Unit)
+          grant.cancel()
+          old.cancelAndJoin()
+          managed?.cancelAndJoin()
+        }
+      }
+    }
+
   @Test fun ordinaryAdmissionRetiresOnlyItsBrowserParticipantBeforeOrAfterPublication() =
     runTest {
       for (delayed in listOf(false, true)) {

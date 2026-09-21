@@ -64,7 +64,9 @@ internal class GatewayIngressController(
     val client: CloudflareAccessClient,
   ) {
     val origin = CloudflareAccessOrigin.from(url)
-    var ordinaryAdmission = false
+
+    // null is unclassified; false is a verified managed challenge, including pending sign-in.
+    var ordinaryAdmission: Boolean? = null
     val url: String
       get() = buildGatewayWebSocketUrl(endpoint.host, endpoint.port, true, endpoint.contextPath)
   }
@@ -260,16 +262,25 @@ internal class GatewayIngressController(
     }
     // Existing service headers or WARP must remain independent of a cached browser
     // grant. Only a verified Access challenge admits managed credentials for this profile.
+    val (preCommitOrdinary, preCommitRevision) =
+      synchronized(lock) {
+        checkRegistrationLocked(registration, isCurrent)
+        registration.ordinaryAdmission to leases[endpoint.stableId]?.takeIf { it.registration === registration }?.snapshot?.revision
+      }
     val ordinaryChallenge = registration.client.discover(registration.url, customHeaders = customHeaders(endpoint.stableId))
     checkRegistration(registration, isCurrent)
     if (ordinaryChallenge == null) {
       val (ordinary, pending) =
         synchronized(lock) {
           checkRegistrationLocked(registration, isCurrent)
+          val revision = leases[endpoint.stableId]?.takeIf { it.registration === registration }?.snapshot?.revision
+          if (registration.ordinaryAdmission != preCommitOrdinary || revision != preCommitRevision) {
+            throw CancellationException("Gateway admission superseded")
+          }
           // A new identity permanently retires old browser waiters, even after a peer
           // settles their shared intent and this profile later becomes managed again.
           val ordinary =
-            registration.takeIf { it.ordinaryAdmission }
+            registration.takeIf { it.ordinaryAdmission == true }
               ?: Registration(endpoint, registration.tls, registration.client).also { registrations[endpoint.stableId] = it }
           ordinary.ordinaryAdmission = true
           leases.remove(endpoint.stableId)?.active?.set(false)
@@ -277,17 +288,17 @@ internal class GatewayIngressController(
           val intent = browserIntent
           val participant = intent?.let(::liveParticipantLocked)
           // Participant predicates can reenter admission. Do not publish over their successor.
-          if (!isRegisteredLocked(ordinary) || !ordinary.ordinaryAdmission) throw CancellationException("Gateway admission superseded")
+          if (!isRegisteredLocked(ordinary) || ordinary.ordinaryAdmission != true) throw CancellationException("Gateway admission superseded")
           val presentation = mutablePresentation.value
           val ownsIntent = intent != null && browserIntent === intent
           publishLocked(
             attention =
               when {
-                ownsIntent && presentation.attention?.attemptId == intent?.id -> participant?.let { presentation.attention?.copy(stableId = it.registration.endpoint.stableId) }
+                ownsIntent && presentation.attention?.attemptId == intent.id -> participant?.let { presentation.attention?.copy(stableId = it.registration.endpoint.stableId) }
                 presentation.attention?.stableId == endpoint.stableId -> null
                 else -> presentation.attention
               },
-            browserLaunch = presentation.browserLaunch.takeUnless { ownsIntent && participant == null && it?.attemptId == intent?.id },
+            browserLaunch = presentation.browserLaunch.takeUnless { ownsIntent && participant == null && it?.attemptId == intent.id },
           )
           ordinary to pending
         }
@@ -295,7 +306,7 @@ internal class GatewayIngressController(
       kotlin.coroutines.coroutineContext.ensureActive()
       synchronized(lock) {
         checkRegistrationLocked(ordinary, isCurrent)
-        if (!ordinary.ordinaryAdmission) throw CancellationException("Gateway admission superseded")
+        if (ordinary.ordinaryAdmission != true) throw CancellationException("Gateway admission superseded")
       }
       return null
     }
@@ -359,7 +370,7 @@ internal class GatewayIngressController(
                       caller.ensureActive()
                       requestContext.ensureActive()
                       isCurrent()
-                    } && isRegisteredLocked(registration) && !registration.ordinaryAdmission &&
+                    } && isRegisteredLocked(registration) && registration.ordinaryAdmission == false &&
                       runCatching { store.withCurrentSnapshot(registration.origin, snapshot.revision, snapshot.revision) { } }.isSuccess
                   }
                 if (!current) throw GatewayExternalAuthorizationException()
