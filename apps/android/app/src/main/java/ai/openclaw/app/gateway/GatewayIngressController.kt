@@ -134,7 +134,7 @@ internal class GatewayIngressController(
           expiryJobs.remove(origin)
         }
       expiry?.cancel()
-      retireDiscoveries { it.snapshot.session.origin == origin }
+      retireDiscoveries { it.snapshot.session.application.origin == origin }
       // No connect task awaits its own drain. Rejections schedule this store-owned boundary.
       retireTransports(origin)
     }
@@ -263,22 +263,39 @@ internal class GatewayIngressController(
     val ordinaryChallenge = registration.client.discover(registration.url, customHeaders = customHeaders(endpoint.stableId))
     checkRegistration(registration, isCurrent)
     if (ordinaryChallenge == null) {
-      val pending =
+      val (ordinary, pending) =
         synchronized(lock) {
           checkRegistrationLocked(registration, isCurrent)
-          registration.ordinaryAdmission = true
+          // A new identity permanently retires old browser waiters, even after a peer
+          // settles their shared intent and this profile later becomes managed again.
+          val ordinary =
+            registration.takeIf { it.ordinaryAdmission }
+              ?: Registration(endpoint, registration.tls, registration.client).also { registrations[endpoint.stableId] = it }
+          ordinary.ordinaryAdmission = true
           leases.remove(endpoint.stableId)?.active?.set(false)
-          // Publication can admit newer managed work on this same registration.
-          // Capture only the probes displaced by this ordinary admission.
           val pending = discoveries.filter { it.registration === registration }
-          publishLocked(attention = attentionAfterAdmissionLocked(registration))
-          pending
+          val intent = browserIntent
+          val participant = intent?.let(::liveParticipantLocked)
+          // Participant predicates can reenter admission. Do not publish over their successor.
+          if (!isRegisteredLocked(ordinary) || !ordinary.ordinaryAdmission) throw CancellationException("Gateway admission superseded")
+          val presentation = mutablePresentation.value
+          val ownsIntent = intent != null && browserIntent === intent
+          publishLocked(
+            attention =
+              when {
+                ownsIntent && presentation.attention?.attemptId == intent?.id -> participant?.let { presentation.attention?.copy(stableId = it.registration.endpoint.stableId) }
+                presentation.attention?.stableId == endpoint.stableId -> null
+                else -> presentation.attention
+              },
+            browserLaunch = presentation.browserLaunch.takeUnless { ownsIntent && participant == null && it?.attemptId == intent?.id },
+          )
+          ordinary to pending
         }
       retireDiscoveries(pending)
       kotlin.coroutines.coroutineContext.ensureActive()
       synchronized(lock) {
-        checkRegistrationLocked(registration, isCurrent)
-        if (!registration.ordinaryAdmission) throw CancellationException("Gateway admission superseded")
+        checkRegistrationLocked(ordinary, isCurrent)
+        if (!ordinary.ordinaryAdmission) throw CancellationException("Gateway admission superseded")
       }
       return null
     }

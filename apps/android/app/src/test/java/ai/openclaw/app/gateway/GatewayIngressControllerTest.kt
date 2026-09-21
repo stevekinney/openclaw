@@ -3566,6 +3566,144 @@ class GatewayIngressControllerTest {
       }
     }
 
+  @Test fun ordinaryAdmissionRetiresOnlyItsBrowserParticipantBeforeOrAfterPublication() =
+    runTest {
+      for (delayed in listOf(false, true)) {
+        for (hasPeer in listOf(false, true)) {
+          val registry = registry()
+          val sibling = endpoint.copy(stableId = "ordinary-browser-peer")
+          add(registry, sibling)
+          val storage = Storage()
+          val publish = CompletableDeferred<Unit>()
+          val grant = CompletableDeferred<CloudflareAccessSession>()
+          var ordinary = false
+          var prompts = 0
+          var authentication: Job? = null
+          val owner =
+            GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
+              client { request -> !(ordinary && target.stableId == endpoint.stableId) && request.header("Cf-Access-Token") == null }
+            }, authenticate = { _, open ->
+              authentication = kotlin.coroutines.coroutineContext[Job]
+              prompts++
+              if (delayed) publish.await()
+              open("https://example.cloudflareaccess.com/login")
+              grant.await()
+            })
+          val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }
+          var peer: Deferred<GatewayIngressAuthorization?>? = null
+          try {
+            runCurrent()
+            val queued = owner.presentation.value.browserLaunch
+            assertEquals(!delayed, queued != null)
+            if (hasPeer) {
+              peer = async { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } }
+              runCurrent()
+            }
+            ordinary = true
+            assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+            // Repeated ordinary preparation keeps its current owner and cannot revive the old waiter.
+            assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+            assertTrue(checkNotNull(authentication).isActive)
+            assertNull(owner.authorization(endpoint))
+            assertFalse(endpoint.stableId in owner.presentation.value.browserRequired)
+            if (!hasPeer) {
+              assertNull(owner.presentation.value.browserLaunch)
+              assertNull(owner.presentation.value.attention)
+              if (queued != null) assertNull(owner.consumeBrowserLaunch(queued.attemptId))
+            }
+            publish.complete(Unit)
+            runCurrent()
+            if (hasPeer) {
+              val launch = checkNotNull(owner.presentation.value.browserLaunch)
+              if (queued != null) assertEquals(queued, launch)
+              assertEquals(
+                sibling.stableId,
+                owner.presentation.value.attention
+                  ?.stableId,
+              )
+              assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+              assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+            } else {
+              assertNull(owner.presentation.value.browserLaunch)
+              assertNull(owner.presentation.value.attention)
+            }
+            grant.complete(CloudflareAccessTestTokens.session("ordinary-peer"))
+            assertTrue(first.await().exceptionOrNull() is CancellationException)
+            if (hasPeer) {
+              checkNotNull(peer?.await()).requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+              assertEquals("ordinary-peer", CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).subject)
+            }
+            assertEquals(1, prompts)
+            assertNull(owner.authorization(endpoint))
+            assertFalse(endpoint.stableId in owner.presentation.value.browserRequired)
+            assertNull(owner.presentation.value.browserLaunch)
+            assertNull(owner.presentation.value.attention)
+          } finally {
+            publish.complete(Unit)
+            grant.cancel()
+            first.cancelAndJoin()
+            peer?.cancelAndJoin()
+          }
+        }
+      }
+    }
+
+  @Test fun ordinaryAdmissionPermanentlyRetiresCompletedBrowserWaitersAcrossManagedReadmission() =
+    runTest {
+      val registry = registry()
+      val sibling = endpoint.copy(stableId = "settled-browser-peer")
+      add(registry, sibling)
+      val storage = Storage()
+      val grant = CompletableDeferred<CloudflareAccessSession>()
+      val paused = PausingDispatcher(StandardTestDispatcher(testScheduler))
+      var ordinary = false
+      var prompts = 0
+      val owner =
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
+          client { request -> !(ordinary && target.stableId == endpoint.stableId) && request.header("Cf-Access-Token") == null }
+        }, authenticate = { _, open ->
+          prompts++
+          open("https://example.cloudflareaccess.com/login")
+          grant.await()
+        })
+      val first = async(paused) { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }
+      var peer: Deferred<GatewayIngressAuthorization?>? = null
+      try {
+        runCurrent()
+        peer = async { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } }
+        runCurrent()
+        val launch = checkNotNull(owner.presentation.value.browserLaunch)
+        assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+        paused.paused = true
+        grant.complete(CloudflareAccessTestTokens.session("completed-peer"))
+        runCurrent()
+        val request = Request.Builder().url(application.origin.uri.toString()).build()
+        checkNotNull(peer.await()).requireCurrent(request)
+        assertFalse(first.isCompleted)
+        assertNull(owner.presentation.value.browserLaunch)
+        assertNull(owner.presentation.value.attention)
+        ordinary = true
+        assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+        ordinary = false
+        val current = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+        current.requireCurrent(request)
+        paused.resume()
+        runCurrent()
+        assertTrue(first.await().exceptionOrNull() is CancellationException)
+        assertSame(current, owner.authorization(endpoint))
+        current.requireCurrent(request)
+        assertEquals(1, prompts)
+        assertEquals("completed-peer", CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).subject)
+        assertNull(owner.presentation.value.browserLaunch)
+        assertNull(owner.presentation.value.attention)
+      } finally {
+        paused.resume()
+        grant.cancel()
+        first.cancelAndJoin()
+        peer?.cancelAndJoin()
+      }
+    }
+
   @Test fun survivingParticipantsOwnDelayedBrowserPublicationAndLaterCoalescing() =
     runTest {
       for (delayed in listOf(false, true)) {
