@@ -520,27 +520,29 @@ class CloudflareAccessSessionStoreTest {
     runTest {
       for (succeeds in listOf(false, true)) {
         val storage = Storage().also { it.deleteSucceeds = succeeds }
-        val store = CloudflareAccessSessionStore(backgroundScope, storage.persistence, authenticate = { _, _ -> CloudflareAccessTestTokens.session("renewed") }, retireTransports = {})
-        val first = store.forget(application.origin)
-        assertEquals(succeeds, runCatching { first.task.await() }.isSuccess)
-        val shared = store.reconcileForget(application.origin)
-        assertSame(first, shared)
-        assertEquals(succeeds, runCatching { shared.task.await() }.isSuccess)
-        assertEquals(listOf("delete"), storage.events)
-        storage.deleteSucceeds = true
-        store.forget(CloudflareAccessOrigin.from("https://other.example.test")).task.await()
-        assertSame(first, store.reconcileForget(application.origin))
-        val explicit = store.forget(application.origin)
-        assertNotSame(first, explicit)
-        explicit.task.await()
-        assertSame(explicit, store.reconcileForget(application.origin))
-        store.signIn(application) {}.await()
-        val afterRenewal = store.reconcileForget(application.origin)
-        assertNotSame(explicit, afterRenewal)
-        assertNotNull(storage.values[application.origin])
-        afterRenewal.start()
-        afterRenewal.task.await()
-        assertNull(storage.values[application.origin])
+        supervisorScope {
+          val store = CloudflareAccessSessionStore(this, storage.persistence, authenticate = { _, _ -> CloudflareAccessTestTokens.session("renewed") }, retireTransports = {})
+          val first = store.forget(application.origin)
+          assertEquals(succeeds, runCatching { first.task.await() }.isSuccess)
+          val shared = store.reconcileForget(application.origin)
+          assertSame(first, shared)
+          assertEquals(succeeds, runCatching { shared.task.await() }.isSuccess)
+          assertEquals(listOf("delete"), storage.events)
+          storage.deleteSucceeds = true
+          store.forget(CloudflareAccessOrigin.from("https://other.example.test")).task.await()
+          assertSame(first, store.reconcileForget(application.origin))
+          val explicit = store.forget(application.origin)
+          assertNotSame(first, explicit)
+          explicit.task.await()
+          assertSame(explicit, store.reconcileForget(application.origin))
+          store.signIn(application) {}.await()
+          val afterRenewal = store.reconcileForget(application.origin)
+          assertNotSame(explicit, afterRenewal)
+          assertNotNull(storage.values[application.origin])
+          afterRenewal.start()
+          afterRenewal.task.await()
+          assertNull(storage.values[application.origin])
+        }
       }
     }
 
