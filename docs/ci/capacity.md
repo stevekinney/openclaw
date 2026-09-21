@@ -214,11 +214,21 @@ local scheduling is unchanged.
 | 16                         | 4 / 15.42 GiB       |                                3 |                         2 |
 | 32                         | 8 / 30.95 GiB       |                                8 |                         2 |
 
-Group pins can lower these ceilings. Only the measured `agentic-gateway-core-2`
-family loses its two-worker compact pin on Blacksmith and hybrid profiles;
-GitHub-hosted planning and other timing-sensitive groups retain it. Gateway
-plans still run exclusively. When core-2 shares a serial bin, its unproven
-siblings retain their two-worker caps at group scope.
+Group pins can lower these ceilings. The measured `agentic-gateway-core-2`,
+`agentic-agents-embedded-base-*`, `agentic-agents-embedded-run`, and
+`agentic-agents-tools` families can use the shared worker ceiling on Blacksmith
+and hybrid profiles. Hosted, frozen-target, and overlapping plans retain the
+two-worker fallback. Gateway plans still run exclusively. When a measured group
+shares a serial bin, its unproven siblings retain their two-worker caps at group
+scope.
+
+Embedded base, attempt-runner, and tool files follow the shared scheduler's file
+parallelism. The base keeps three balanced stripes for its large harness files;
+the separate overflow-compaction and incomplete-turn configs remain serial.
+Parallel agent wall times use distinct timing keys. Until those measurements
+arrive, the planner divides legacy serial costs by two effective workers while
+retaining the largest indivisible file's cost. Fresh parallel measurements
+replace that fallback without another discount.
 
 Agents-core files share the configured worker pool, including local scheduling
 and its one-worker throttle. Compact agents-core groups retain a two-worker cap.
