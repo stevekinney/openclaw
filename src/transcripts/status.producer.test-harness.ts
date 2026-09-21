@@ -2,8 +2,16 @@ import path from "node:path";
 import { afterEach, beforeEach, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createTranscriptsTool } from "../agents/tools/transcripts-tool.js";
+import { createPluginMetadataSnapshot } from "../config/plugin-auto-enable.test-helpers.js";
 import { resetConfigRuntimeState } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { selectCurrentPluginMetadataCache } from "../plugins/current-plugin-metadata-state.js";
+import { setCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata.test-support.js";
+import {
+  createPluginCache,
+  getProcessPluginCache,
+  retirePluginCache,
+} from "../plugins/plugin-cache.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import {
   captureActivePluginRegistrySnapshot,
@@ -30,8 +38,13 @@ export const transcriptStatusRoom = {
 export function useTranscriptStatusFixture() {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   let previousRegistry: ReturnType<typeof captureActivePluginRegistrySnapshot>;
+  let previousCache: ReturnType<typeof getProcessPluginCache>;
+  let cache: ReturnType<typeof createPluginCache>;
   beforeEach(() => {
     previousRegistry = captureActivePluginRegistrySnapshot();
+    previousCache = getProcessPluginCache();
+    cache = createPluginCache({ kind: "process" });
+    selectCurrentPluginMetadataCache(cache);
   });
   afterEach(async () => {
     await clearTranscriptCapturesForTest();
@@ -40,12 +53,18 @@ export function useTranscriptStatusFixture() {
     await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     restoreActivePluginRegistrySnapshot(previousRegistry);
+    selectCurrentPluginMetadataCache(previousCache);
+    await retirePluginCache(cache);
     vi.restoreAllMocks();
   });
 
   return function fixture(
     config: OpenClawConfig = { transcripts: { autoStart: [transcriptStatusRoom] } },
   ) {
+    setCurrentPluginMetadataSnapshot(
+      createPluginMetadataSnapshot({ config, manifestRegistry: { plugins: [], diagnostics: [] } }),
+      { config },
+    );
     const stateDir = tempDirs.make("transcript-status-producer-");
     const store = new TranscriptsStore(path.join(stateDir, "transcripts"), {
       env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },

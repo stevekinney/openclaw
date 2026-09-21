@@ -1,22 +1,43 @@
 import type { IncomingMessage } from "node:http";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { getRuntimeConfig } from "../config/io.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { ensureProfileForEmail, setUserProfileRole } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   resolveControlUiPluginAuthCookieGrants,
   setControlUiPluginAuthCookie,
 } from "./control-ui-plugin-auth-cookie.js";
-import { authorizeControlUiPluginCookieRequest } from "./http-auth-plugin-cookie.js";
+import {
+  authorizeControlUiPluginCookieRequest,
+  resolveControlUiPluginAuthCookieGeneration,
+} from "./http-auth-plugin-cookie.js";
+import {
+  authorizePluginGatewayHttpRequestOrReply,
+  setControlUiPluginAuthCookieForRequest,
+} from "./http-auth-utils.js";
 import { invalidateOperatorRolePolicy } from "./operator-role-policy.js";
+import { resolveSharedGatewaySessionGeneration } from "./server/ws-shared-generation.js";
 import { makeMockHttpResponse } from "./test-http-response.js";
 import { withTempConfig } from "./test-temp-config.js";
 
-function issueCookie(profileId?: string, pluginId = "example"): string {
+afterEach(() => resetPluginRuntimeStateForTest());
+
+function issueCookie(
+  profileId?: string,
+  pluginId = "example",
+  generation = resolveControlUiPluginAuthCookieGeneration("generation", getRuntimeConfig()),
+): string {
   const { res, setHeader } = makeMockHttpResponse();
   setControlUiPluginAuthCookie(
     res,
     [{ pluginId, path: "/plugins/example", match: "prefix", scopes: ["operator.read"] }],
-    { generation: "generation", ...(profileId ? { profileId } : {}) },
+    {
+      generation,
+      ...(profileId ? { profileId } : {}),
+    },
   );
   const value = setHeader.mock.calls.at(-1)?.[1];
   const header = Array.isArray(value) ? value[0] : value;
@@ -57,6 +78,121 @@ async function withRoleConfig(run: () => Promise<void>) {
 }
 
 describe("Control UI plugin auth cookie profile binding", () => {
+  it("revokes issued Tailscale cookies on policy changes without rotating shared credentials", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      await withTempConfig({
+        cfg: { gateway: { auth: { allowTailscale: true } } },
+        run: async () => {
+          const registry = createEmptyPluginRegistry();
+          registry.controlUiDescriptors.push({
+            pluginId: "example",
+            source: "example",
+            descriptor: { id: "panel", surface: "tab", label: "Panel", path: "/plugins/example" },
+          });
+          registry.httpRoutes.push({
+            pluginId: "example",
+            source: "example",
+            path: "/plugins/example",
+            match: "prefix",
+            auth: "gateway",
+            handler: async () => true,
+          });
+          setActivePluginRegistry(registry);
+          const auth = { mode: "token" as const, token: "shared-secret", allowTailscale: true };
+          const generation = resolveSharedGatewaySessionGeneration(auth);
+          const profile = ensureProfileForEmail("tailscale-reader@example.test");
+          const issued = makeMockHttpResponse();
+          setControlUiPluginAuthCookieForRequest(
+            { headers: {} } as IncomingMessage,
+            issued.res,
+            "tailscale",
+            true,
+            generation,
+            getRuntimeConfig(),
+            undefined,
+            profile.id,
+          );
+          const value = issued.setHeader.mock.calls.find(([name]) => name === "Set-Cookie")?.[1];
+          const header = Array.isArray(value) ? value[0] : value;
+          expect(typeof header).toBe("string");
+          const request = { method: "GET", headers: { cookie: header } } as IncomingMessage;
+          const authorize = async (allowTailscale: boolean) => {
+            const response = makeMockHttpResponse();
+            const result = await authorizePluginGatewayHttpRequestOrReply({
+              req: request,
+              res: response.res,
+              auth: { ...auth, allowTailscale },
+              cfg: getRuntimeConfig(),
+              requestPath: "/plugins/example/view",
+              resolveOperatorScopes: () => [],
+            });
+            return { result, response };
+          };
+          expect((await authorize(true)).result?.requestAuth.controlUiPluginGrants).toMatchObject([
+            { pluginId: "example", scopes: ["operator.read"] },
+          ]);
+          setRuntimeConfigSnapshot({ ...getRuntimeConfig(), ui: { seamColor: "#334455" } });
+          expect((await authorize(true)).result).not.toBeNull();
+
+          setRuntimeConfigSnapshot({ gateway: { auth: { allowTailscale: false } } });
+          expect(resolveSharedGatewaySessionGeneration({ ...auth, allowTailscale: false })).toBe(
+            generation,
+          );
+          const revoked = await authorize(false);
+          expect(revoked.result).toBeNull();
+          expect(revoked.response.res.statusCode).toBe(401);
+        },
+      });
+    });
+  });
+
+  it("issues read-only plugin frame grants for Tailscale-authenticated bootstrap", () => {
+    const registry = createEmptyPluginRegistry();
+    registry.controlUiDescriptors.push({
+      pluginId: "demo-plugin",
+      source: "demo-plugin",
+      descriptor: {
+        surface: "tab",
+        id: "demo",
+        label: "Demo",
+        path: "/secure-hook/panel",
+        requiredScopes: ["operator.admin"],
+      },
+    });
+    registry.httpRoutes.push({
+      pluginId: "demo-plugin",
+      source: "demo-plugin",
+      path: "/secure-hook",
+      auth: "gateway",
+      match: "prefix",
+      handler: async () => true,
+    });
+    setActivePluginRegistry(registry);
+    const { res, setHeader } = makeMockHttpResponse();
+
+    expect(
+      setControlUiPluginAuthCookieForRequest(
+        { headers: {} } as IncomingMessage,
+        res,
+        "tailscale",
+        true,
+        "test-generation",
+        {},
+      ),
+    ).toEqual([
+      {
+        pluginId: "demo-plugin",
+        path: "/secure-hook",
+        match: "prefix",
+        scopes: ["operator.read"],
+      },
+    ]);
+    expect(setHeader).toHaveBeenCalledWith(
+      "Set-Cookie",
+      expect.arrayContaining([expect.stringContaining("Path=/secure-hook")]),
+    );
+  });
+
   it("retains the signed viewer without named roles and rejects an unavailable viewer", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await withTempConfig({
@@ -131,7 +267,7 @@ describe("Control UI plugin auth cookie profile binding", () => {
 
   it("preserves the authenticated durable profile inside the signed grant", () => {
     const request = {
-      headers: { cookie: issueCookie("profile-guest") },
+      headers: { cookie: issueCookie("profile-guest", "example", "generation") },
     } as IncomingMessage;
 
     expect(
@@ -151,7 +287,9 @@ describe("Control UI plugin auth cookie profile binding", () => {
   });
 
   it("keeps legacy grants unchanged when no profile is bound", async () => {
-    const request = { headers: { cookie: issueCookie() } } as IncomingMessage;
+    const request = {
+      headers: { cookie: issueCookie(undefined, "example", "generation") },
+    } as IncomingMessage;
 
     expect(
       resolveControlUiPluginAuthCookieGrants(request, {

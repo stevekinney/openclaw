@@ -39,9 +39,9 @@ import {
   mergeSecretsRuntimeEnv,
   resolveRefreshAgentDirs,
 } from "./runtime-fast-path.js";
-import { activateProviderAuthRuntimeSnapshot } from "./runtime-provider-auth-activation.js";
 import { mergeProviderAuthRuntimeWarnings } from "./runtime-provider-auth-warnings.js";
 import {
+  activateProviderAuthRuntimeSnapshot,
   activateSecretsRuntimeSnapshotState,
   activateSecretsRuntimeSnapshotStateIfCurrent,
   clearSecretsRuntimeSnapshotState,

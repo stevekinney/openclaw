@@ -54,6 +54,31 @@ describe("committed browser origin policy", () => {
 });
 
 describe("committed authentication policy", () => {
+  it.each(["requiredHeaders", "allowUsers"] as const)(
+    "keeps clients connected when trusted-proxy %s are reordered",
+    (field) => {
+      const trustedProxy = {
+        userHeader: "x-user",
+        requiredHeaders: ["x-forwarded-proto", "x-forwarded-host"],
+        allowUsers: ["reader@example.test", "writer@example.test"],
+      };
+      const client = {
+        authPolicyGeneration: resolveGatewayAuthPolicyGeneration({
+          gateway: { auth: { trustedProxy } },
+        }),
+        socket: { close: vi.fn() },
+        invalidated: false,
+      };
+      disconnectDisallowedGatewayPolicyClients([client], {
+        gateway: {
+          auth: { trustedProxy: { ...trustedProxy, [field]: trustedProxy[field].toReversed() } },
+        },
+      });
+      expect(client.socket.close).not.toHaveBeenCalled();
+      expect(client.invalidated).toBe(false);
+    },
+  );
+
   it.each<OpenClawConfig["gateway"]>([
     { trustedProxies: ["192.0.2.10"] },
     { allowRealIpFallback: true },

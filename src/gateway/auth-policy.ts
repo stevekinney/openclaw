@@ -9,13 +9,18 @@ export function resolveGatewayAuthPolicyGeneration(config: OpenClawConfig): stri
   let generation = generations.get(config);
   if (generation === undefined) {
     const gateway = config.gateway;
+    const trustedProxy = gateway?.auth?.trustedProxy;
     generation = stableStringify({
       roles: gateway?.roles,
       trustedProxies: gateway?.trustedProxies?.toSorted(),
       allowRealIpFallback: gateway?.allowRealIpFallback,
       allowTailscale: gateway?.auth?.allowTailscale,
       identityScopes: gateway?.auth?.identityScopes,
-      trustedProxy: gateway?.auth?.trustedProxy,
+      trustedProxy: trustedProxy && {
+        ...trustedProxy,
+        requiredHeaders: (trustedProxy.requiredHeaders ?? []).toSorted(),
+        allowUsers: (trustedProxy.allowUsers ?? []).toSorted(),
+      },
     });
     generations.set(config, generation);
   }

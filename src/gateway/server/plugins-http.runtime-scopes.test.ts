@@ -18,7 +18,10 @@ import { ensureProfileForEmail, linkEmail, setUserProfileRole } from "../../stat
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { setControlUiPluginAuthCookie } from "../control-ui-plugin-auth-cookie.js";
 import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
-import { authorizeControlUiPluginCookieRequest } from "../http-auth-plugin-cookie.js";
+import {
+  authorizeControlUiPluginCookieRequest,
+  resolveControlUiPluginAuthCookieGeneration,
+} from "../http-auth-plugin-cookie.js";
 import type { AuthorizedGatewayHttpRequest } from "../http-utils.js";
 import { authorizeOperatorScopesForMethod, CLI_DEFAULT_OPERATOR_SCOPES } from "../method-scopes.js";
 import { invalidateOperatorRolePolicy } from "../operator-role-policy.js";
@@ -753,20 +756,17 @@ async function withCookieSessionReader(
         });
         bindSessionRowProjection(context, () => projection);
         const cookieResponse = makeMockHttpResponse();
-        setControlUiPluginAuthCookie(
-          cookieResponse.res,
-          [
-            {
-              pluginId: "route",
-              path: SECURE_HOOK_PATH,
-              match: "exact",
-              scopes: ["operator.read"],
-            },
-          ],
-          { generation: "http-generation", profileId: reader.id },
-        );
-        const header = cookieResponse.setHeader.mock.calls.at(-1)?.[1];
-        const value = Array.isArray(header) ? header[0] : header;
+        const grant = {
+          pluginId: "route",
+          path: SECURE_HOOK_PATH,
+          match: "exact" as const,
+          scopes: ["operator.read" as const],
+        };
+        setControlUiPluginAuthCookie(cookieResponse.res, [grant], {
+          generation: resolveControlUiPluginAuthCookieGeneration("http-generation", config),
+          profileId: reader.id,
+        });
+        const value = cookieResponse.setHeader.mock.calls.at(-1)?.[1]?.[0];
         if (typeof value !== "string") {
           throw new Error("expected signed HTTP plugin cookie");
         }

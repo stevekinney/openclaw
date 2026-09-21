@@ -4,7 +4,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import * as diagnostics from "../agents/auth-profiles/legacy-source-diagnostic.js";
 import * as authSnapshots from "../agents/auth-profiles/runtime-snapshots.js";
-import * as activation from "./runtime-provider-auth-activation.js";
 import * as state from "./runtime-state.js";
 
 vi.mock("./runtime.js", () => {
@@ -39,7 +38,7 @@ it("retires migration refusals and the provider publisher before the resolver ru
   const refusal = new diagnostics.AuthProfileMigrationRequiredError({ agentDir, sources: [] });
   diagnostics.markAuthProfileMigrationRequired(agentDir, refusal);
   const published = vi.fn(async () => {});
-  activation.registerProviderAuthRuntimeSnapshotActivationOwner({
+  state.registerProviderAuthRuntimeSnapshotActivationOwner({
     runExclusive: (run) => run(),
     isCurrent: () => true,
     assertValid: () => {},
@@ -54,19 +53,18 @@ it("retires migration refusals and the provider publisher before the resolver ru
     activateSnapshotIfCurrent: () => true,
   };
   try {
-    await expect(activation.activateProviderAuthRuntimeSnapshot(candidate)).resolves.toBe(true);
+    await expect(state.activateProviderAuthRuntimeSnapshot(candidate)).resolves.toBe(true);
     expect(published).toHaveBeenCalledOnce();
     expect(() => diagnostics.assertAuthProfileMigrationReady(agentDir)).toThrow(refusal);
 
     state.clearSecretsRuntimeSnapshotState();
 
-    await expect(activation.activateProviderAuthRuntimeSnapshot(candidate)).resolves.toBe(true);
+    await expect(state.activateProviderAuthRuntimeSnapshot(candidate)).resolves.toBe(true);
     expect(published).toHaveBeenCalledOnce();
     expect(() => diagnostics.assertAuthProfileMigrationReady(agentDir)).not.toThrow();
   } finally {
     state.clearSecretsRuntimeSnapshotState();
     diagnostics.clearAuthProfileMigrationDiagnostics();
-    activation.clearProviderAuthRuntimeSnapshotActivation();
   }
 });
 

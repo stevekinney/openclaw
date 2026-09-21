@@ -26,6 +26,7 @@ export type GatewayHttpRequestAuthority = {
 };
 
 export type GatewayHttpResponseAuthority = GatewayHttpRequestAuthority & {
+  assertCurrent: () => void;
   revalidate: () => Promise<void>;
 };
 
@@ -69,18 +70,21 @@ export function bindHttpResponseAuthority<T>(
   res: ServerResponse,
   hasCurrentClientAuthority: () => boolean,
 ): T & GatewayHttpResponseAuthority {
+  const assertCurrent = () => {
+    if (res.writableEnded || res.destroyed) {
+      throw new Error("HTTP request authority expired");
+    }
+    if (!hasCurrentClientAuthority()) {
+      res.removeHeader("Set-Cookie");
+      sendUnauthorized(res);
+      throw new Error("Unauthorized");
+    }
+  };
   return {
     ...auth,
     hasCurrentClientAuthority: () =>
       !res.writableEnded && !res.destroyed && hasCurrentClientAuthority(),
-    revalidate: async () => {
-      if (res.writableEnded || res.destroyed) {
-        throw new Error("HTTP request authority expired");
-      }
-      if (!hasCurrentClientAuthority()) {
-        sendUnauthorized(res);
-        throw new Error("Unauthorized");
-      }
-    },
+    assertCurrent,
+    revalidate: async () => assertCurrent(),
   };
 }

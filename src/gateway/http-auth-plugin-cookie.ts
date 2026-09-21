@@ -2,8 +2,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isDeepStrictEqual } from "node:util";
 import { getRuntimeConfig } from "../config/io.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { sha256Base64Url } from "../infra/crypto-digest.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
 import { getUserProfileListItem } from "../state/user-profiles.js";
+import { resolveGatewayAuthPolicyGeneration } from "./auth-policy.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
 import { resolveControlUiPluginAuthCookieGrants } from "./control-ui-plugin-auth-cookie.js";
 import { applyHttpOperatorRoleScopeCeiling, resolveHttpProfile } from "./http-auth-user-profile.js";
@@ -12,6 +15,15 @@ import { normalizeOperatorScopeList } from "./operator-scopes.js";
 import { resolveSharedGatewaySessionGeneration } from "./server/ws-shared-generation.js";
 
 type CookieRequestAuth = NonNullable<ReturnType<typeof authorizeControlUiPluginCookieRequest>>;
+
+export function resolveControlUiPluginAuthCookieGeneration(
+  authGeneration: string | undefined,
+  cfg: OpenClawConfig,
+): string | undefined {
+  return authGeneration
+    ? sha256Base64Url(`${authGeneration}\0${resolveGatewayAuthPolicyGeneration(cfg)}`)
+    : undefined;
+}
 
 export function authorizeControlUiPluginCookieRequest(
   req: IncomingMessage,
@@ -25,14 +37,14 @@ export function authorizeControlUiPluginCookieRequest(
   // Native plugins and the UI they serve share the Gateway's trusted in-process
   // boundary. Cross-site sandbox descendants need an ambient cookie, so this
   // handoff is read-only; mutations stay on explicit Gateway auth surfaces.
+  const cfg = getRuntimeConfig();
   const grants = resolveControlUiPluginAuthCookieGrants(req, {
     requestPath: params.requestPath,
-    generation: params.authGeneration,
+    generation: resolveControlUiPluginAuthCookieGeneration(params.authGeneration, cfg),
   });
   if (grants.length === 0) {
     return null;
   }
-  const cfg = getRuntimeConfig();
   let authenticatedProfile: Partial<ReturnType<typeof resolveHttpProfile>> = {};
   const profileId = grants[0]?.profileId;
   if (grants.some((grant) => grant.profileId !== profileId) || (cfg.gateway?.roles && !profileId)) {

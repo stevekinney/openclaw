@@ -140,7 +140,7 @@ describe("configured transcript source provenance", () => {
       });
       let current = f.ctx.config;
       setRuntimeConfigSnapshot(current, current);
-      const publish = (candidate: OpenClawConfig) => {
+      const publish = (candidate: OpenClawConfig, reloadPlugins = false) => {
         const plan = buildGatewayReloadPlan(
           diffGatewayReloadPaths(current, candidate, listConfigReloadRefinementPrefixes()),
           {
@@ -148,7 +148,9 @@ describe("configured transcript source provenance", () => {
             candidateConfig: candidate,
           },
         );
-        expect(isNoopGatewayReloadPlan(plan)).toBe(true);
+        expect(plan.restartGateway).toBe(false);
+        expect(plan.reloadPlugins).toBe(reloadPlugins);
+        expect(isNoopGatewayReloadPlan(plan)).toBe(!reloadPlugins);
         setRuntimeConfigSnapshot(candidate, candidate);
         current = candidate;
       };
@@ -177,10 +179,15 @@ describe("configured transcript source provenance", () => {
             });
           }
           const { title: _title, ...intent } = source;
-          publish({
-            ...current,
-            transcripts: { autoStart: [{ ...intent, ...(title === undefined ? {} : { title }) }] },
-          });
+          publish(
+            {
+              ...current,
+              transcripts: {
+                autoStart: [{ ...intent, ...(title === undefined ? {} : { title }) }],
+              },
+            },
+            true,
+          );
           await vi.advanceTimersByTimeAsync(5_000);
           expect(start).not.toHaveBeenCalled();
           expect(await f.store.listSessionEntries()).toHaveLength(0);
@@ -274,6 +281,7 @@ describe("configured transcript source provenance", () => {
   });
 
   it("bounds unavailable-start diagnostics and clears them with their service", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const f = fixture({
       transcripts: {
         autoStart: Array.from({ length: 101 }, (_, index) => ({

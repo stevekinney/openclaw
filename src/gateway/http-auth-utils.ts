@@ -30,6 +30,7 @@ import {
 import {
   authorizeControlUiPluginCookieRequest,
   bindControlUiPluginCookieRequestAuthority,
+  resolveControlUiPluginAuthCookieGeneration,
 } from "./http-auth-plugin-cookie.js";
 import {
   applyHttpOperatorRoleScopeCeiling,
@@ -307,7 +308,7 @@ async function checkHttpOperatorCredentials(
 /** Authorize a read-only same-origin Control UI request, including paired devices. */
 export async function authorizeControlUiReadRequestOrReply(
   params: ControlUiReadAuthParams,
-): Promise<AuthorizedControlUiReadRequest | null> {
+): Promise<(AuthorizedControlUiReadRequest & GatewayHttpResponseAuthority) | null> {
   const auth = params.auth;
   const cfg = params.cfg ?? getRuntimeConfig();
   const hasCurrentClientAuthority = captureHttpRequestAuthority({
@@ -361,6 +362,7 @@ export async function authorizeControlUiReadRequestOrReply(
       authMethod,
       trustDeclaredOperatorScopes,
       authGeneration,
+      cfg,
       operatorScopes,
       authenticatedProfile.authenticatedUserProfile?.profileId,
     ),
@@ -386,7 +388,7 @@ export async function authorizeControlUiReadRequestOrReply(
  */
 export async function authorizeControlUiSessionOwnerReadRequestOrReply(
   params: Omit<ControlUiReadAuthParams, "allowQueryToken" | "requiredOperatorMethod">,
-): Promise<AuthorizedControlUiReadRequest | null> {
+): Promise<(AuthorizedControlUiReadRequest & GatewayHttpResponseAuthority) | null> {
   const requestAuth = await authorizeControlUiReadRequestOrReply({
     ...params,
     requiredOperatorMethod: "sessions.list",
@@ -423,6 +425,7 @@ export function setControlUiPluginAuthCookieForRequest(
   authMethod: GatewayAuthResult["method"],
   trustDeclaredOperatorScopes: boolean,
   authGeneration: string | undefined,
+  cfg: OpenClawConfig,
   authenticatedScopes?: readonly string[],
   authenticatedProfileId?: string,
 ): ControlUiPluginTabAuthGrant[] {
@@ -438,8 +441,8 @@ export function setControlUiPluginAuthCookieForRequest(
   const grants = listControlUiPluginTabAuthGrants(scopes);
   if (grants.length > 0) {
     return setControlUiPluginAuthCookie(res, grants, {
-      generation: authGeneration,
-      basePath: getRuntimeConfig().gateway?.controlUi?.basePath,
+      generation: resolveControlUiPluginAuthCookieGeneration(authGeneration, cfg),
+      basePath: cfg.gateway?.controlUi?.basePath,
       request: req,
       ...(authenticatedProfileId ? { profileId: authenticatedProfileId } : {}),
     });

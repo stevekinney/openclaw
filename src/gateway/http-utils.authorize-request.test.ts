@@ -104,6 +104,7 @@ describe("authorizeGatewayHttpRequestOrReply", () => {
         }),
       ).resolves.toEqual({
         hasCurrentClientAuthority: expect.any(Function),
+        assertCurrent: expect.any(Function),
         revalidate: expect.any(Function),
         authMethod: method,
         trustDeclaredOperatorScopes: false,
@@ -174,6 +175,7 @@ describe("authorizeGatewayHttpRequestOrReply", () => {
           }),
         ).resolves.toEqual({
           hasCurrentClientAuthority: expect.any(Function),
+          assertCurrent: expect.any(Function),
           revalidate: expect.any(Function),
           authMethod: "trusted-proxy",
           user: "guest@example.test",
@@ -244,6 +246,7 @@ describe("authorizeGatewayHttpRequestOrReply", () => {
         } else {
           expect(result).toEqual({
             hasCurrentClientAuthority: expect.any(Function),
+            assertCurrent: expect.any(Function),
             revalidate: expect.any(Function),
             authMethod: "trusted-proxy",
             user: "guest@example.test",
@@ -286,6 +289,7 @@ describe("authorizeGatewayHttpRequestOrReply", () => {
       }),
     ).resolves.toEqual({
       hasCurrentClientAuthority: expect.any(Function),
+      assertCurrent: expect.any(Function),
       revalidate: expect.any(Function),
       authMethod: "trusted-proxy",
       user: "guest@example.test",
@@ -407,6 +411,7 @@ describe("authorizeGatewayHttpRequestOrReply", () => {
         }),
       ).resolves.toEqual({
         hasCurrentClientAuthority: expect.any(Function),
+        assertCurrent: expect.any(Function),
         revalidate: expect.any(Function),
         authMethod: "token",
         trustDeclaredOperatorScopes: false,

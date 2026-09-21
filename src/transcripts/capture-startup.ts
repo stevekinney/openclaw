@@ -1,4 +1,4 @@
-import type { TranscriptsRuntimeContext } from "./capture.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { TranscriptSessionDescriptor } from "./provider-types.js";
 
 export class TranscriptStartError extends Error {
@@ -58,9 +58,7 @@ export function revokeTranscriptStartRetries(
 
 export const capturePolicyTransitions = new Map<string, symbol>();
 
-export function assertTranscriptCaptureEnabled(
-  ctx: Pick<TranscriptsRuntimeContext, "config" | "stateDir">,
-) {
+export function assertTranscriptCaptureEnabled(ctx: { config?: OpenClawConfig; stateDir: string }) {
   if (ctx.config?.transcripts?.enabled === false || capturePolicyTransitions.has(ctx.stateDir)) {
     throw new Error("transcripts are disabled");
   }

@@ -48,7 +48,6 @@ import {
   type DegradedSecretOwner,
   type SecretOwnerRefState,
 } from "./runtime-degraded-state.js";
-import { clearProviderAuthRuntimeSnapshotActivation } from "./runtime-provider-auth-activation.js";
 import type { SecretResolverWarning } from "./runtime-shared.js";
 import {
   clearActiveRuntimeWebToolsMetadata,
@@ -141,6 +140,13 @@ export type SecretsRuntimeRefreshContext = {
   manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
 };
 
+type ProviderAuthRuntimeSnapshotActivation = (params: {
+  snapshot: PreparedSecretsRuntimeSnapshot;
+  expectedRevision: number;
+  activateSnapshotIfCurrent: () => boolean;
+}) => Promise<boolean>;
+
+let providerAuthActivation: ProviderAuthRuntimeSnapshotActivation | null = null;
 let activeSnapshot: PreparedSecretsRuntimeSnapshot | null = null;
 let activeSnapshotRevision = 0;
 let activeSnapshotLineageStartRevision = 0;
@@ -1225,6 +1231,39 @@ function getLiveSecretsRuntimeAuthStores(): PreparedSecretsRuntimeSnapshot["auth
   );
 }
 
+export function registerProviderAuthRuntimeSnapshotActivationOwner(owner: {
+  runExclusive: (operation: () => Promise<boolean>) => Promise<boolean>;
+  isCurrent: (snapshot: PreparedSecretsRuntimeSnapshot, expectedRevision: number) => boolean;
+  assertValid: (snapshot: PreparedSecretsRuntimeSnapshot) => void;
+  publish: (snapshot: PreparedSecretsRuntimeSnapshot) => Promise<void>;
+  onError: (error: unknown, snapshot: PreparedSecretsRuntimeSnapshot) => never;
+}): void {
+  providerAuthActivation = async (params) =>
+    await owner.runExclusive(async () => {
+      if (!owner.isCurrent(params.snapshot, params.expectedRevision)) {
+        return false;
+      }
+      try {
+        owner.assertValid(params.snapshot);
+        if (!params.activateSnapshotIfCurrent()) {
+          return false;
+        }
+        await owner.publish(params.snapshot);
+        return true;
+      } catch (error) {
+        return owner.onError(error, params.snapshot);
+      }
+    });
+}
+
+export async function activateProviderAuthRuntimeSnapshot(
+  params: Parameters<ProviderAuthRuntimeSnapshotActivation>[0],
+): Promise<boolean> {
+  return providerAuthActivation
+    ? await providerAuthActivation(params)
+    : params.activateSnapshotIfCurrent();
+}
+
 /**
  * Clears active secrets runtime state and all linked config/auth/web-tool snapshots.
  */
@@ -1242,6 +1281,6 @@ export function clearSecretsRuntimeSnapshotState(): void {
   clearRuntimeConfigSnapshot();
   clearRuntimeAuthProfileStoreSnapshots();
   clearAuthProfileMigrationDiagnostics();
-  clearProviderAuthRuntimeSnapshotActivation();
+  providerAuthActivation = null;
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

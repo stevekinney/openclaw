@@ -59,6 +59,7 @@ function authorizedRequest(overrides: Partial<RequestAuth> = {}): RequestAuth {
   return {
     trustDeclaredOperatorScopes: true,
     hasCurrentClientAuthority: () => true,
+    assertCurrent: () => {},
     revalidate: async () => {},
     ...overrides,
   };

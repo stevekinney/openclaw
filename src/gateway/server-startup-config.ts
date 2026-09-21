@@ -24,7 +24,6 @@ import {
   collectCandidateAgentDirs,
   prepareSecretsRuntimeFastPathSnapshot,
 } from "../secrets/runtime-fast-path.js";
-import { registerProviderAuthRuntimeSnapshotActivationOwner } from "../secrets/runtime-provider-auth-activation.js";
 import {
   listProviderAuthDegradedOwners,
   preparedDegradationSupportsSourceOnlyRecovery,
@@ -39,6 +38,7 @@ import {
   hasActiveSecretsRuntimeSnapshotLineage,
   hasSameSecretReloadContract,
   hasCurrentAuthStoreCredentialsRevision,
+  registerProviderAuthRuntimeSnapshotActivationOwner,
 } from "../secrets/runtime-state.js";
 import { logRuntimeSecretWarnings } from "../secrets/runtime-warning-log.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
