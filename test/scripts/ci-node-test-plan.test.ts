@@ -368,7 +368,15 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
       ["core-runtime-media-ui-13", 110],
       ["core-unit-src-security-13", 50],
     ] as const;
-    vi.spyOn(testTimings, "readCompactGroupTimings").mockReturnValue(Object.fromEntries(entries));
+    // These synthetic costs already describe parallel embedded invocations.
+    vi.spyOn(testTimings, "readCompactGroupTimings").mockReturnValue(
+      Object.fromEntries(
+        entries.map(([name, seconds]) => [
+          name.startsWith("agentic-agents-embedded-base-") ? `${name}#file-parallel` : name,
+          seconds,
+        ]),
+      ),
+    );
     vi.spyOn(testTimings, "readRuntimePlacementTimings").mockReturnValue([]);
     vi.spyOn(buildPrerequisites, "resolveVitestPretestBuildMode").mockReturnValue(undefined);
     const original = fullSuiteVitestShards.slice();
@@ -515,7 +523,7 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
 
   it.each([
     { runnerBackend: "blacksmith", serialEstimate: 60, parallelEstimate: 24 },
-    { runnerBackend: "blacksmith", serialEstimate: 39, parallelEstimate: 24, indivisible: true },
+    { runnerBackend: "blacksmith", serialEstimate: 53, parallelEstimate: 24, indivisible: true },
     { runnerBackend: "hybrid", serialEstimate: 52, parallelEstimate: 21 },
     { runnerBackend: "github", serialEstimate: 80, parallelEstimate: 24 },
   ])(
@@ -563,7 +571,7 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
               job.groups.some((group) =>
                 indivisible
                   ? group.includePatterns?.includes(
-                      "src/agents/embedded-agent-runner/compact.hooks.test.ts",
+                      "src/agents/embedded-agent-runner/run.compaction-runtime.test.ts",
                     )
                   : group.shard_name === owner,
               ),
