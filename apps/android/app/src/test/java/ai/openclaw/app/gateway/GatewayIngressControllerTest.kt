@@ -27,6 +27,9 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.mockwebserver.MockResponse
@@ -122,15 +125,31 @@ class GatewayIngressControllerTest {
     assertTrue(generateSequence(actual) { it.cause }.any { it === expected })
   }
 
-  private fun client(probe: suspend (Request) -> Boolean = { it.header("Cf-Access-Token") == null }): CloudflareAccessClient =
+  private fun client(
+    descriptor: () -> CloudflareAccessApplication = { application },
+    probe: suspend (Request) -> Boolean = { it.header("Cf-Access-Token") == null },
+  ): CloudflareAccessClient =
     CloudflareAccessClient { request, _, _ ->
+      val application = descriptor()
       when {
         request.url.host == application.issuer.host -> {
           CloudflareAccessClient.Reply(request.url.toString(), 200, Headers.Builder().build(), CloudflareAccessTestTokens.jwks)
         }
 
         request.method == "HEAD" -> {
-          CloudflareAccessClient.Reply(request.url.toString(), 200, Headers.Builder().add("Cf-Access-Metadata", CloudflareAccessTestTokens.metadata()).build(), byteArrayOf())
+          val metadata =
+            CloudflareAccessTestTokens.token(
+              JsonObject(
+                mapOf(
+                  "type" to JsonPrimitive("match"),
+                  "hostname" to JsonPrimitive(application.origin.uri.host),
+                  "auth_domain" to JsonPrimitive(application.issuer.host),
+                  "aud" to JsonPrimitive(application.audience),
+                  "iat" to JsonPrimitive(System.currentTimeMillis() / 1000.0),
+                ),
+              ),
+            )
+          CloudflareAccessClient.Reply(request.url.toString(), 200, Headers.Builder().add("Cf-Access-Metadata", metadata).build(), byteArrayOf())
         }
 
         else -> {
@@ -141,6 +160,19 @@ class GatewayIngressControllerTest {
         }
       }
     }
+
+  private fun sessionFor(application: CloudflareAccessApplication): CloudflareAccessSession {
+    val expires = System.currentTimeMillis() / 1000.0 + 3600
+    val claims =
+      JsonObject(
+        CloudflareAccessTestTokens.claims("replacement", expires) +
+          mapOf(
+            "iss" to JsonPrimitive(application.issuer.toString()),
+            "aud" to JsonArray(listOf(JsonPrimitive(application.audience))),
+          ),
+      )
+    return CloudflareAccessSession(application, "replacement", expires, CloudflareAccessTestTokens.token(claims))
+  }
 
   @Test fun ordinaryAndServiceHeaderRoutesNeverPresentBrowser() =
     runTest {
@@ -2988,6 +3020,165 @@ class GatewayIngressControllerTest {
           }
         }
       }
+    }
+
+  @Test fun completedSharedTaskCannotAcquireANewGenerationOnItsOldBrowserIntent() =
+    runTest {
+      for (reverse in listOf(false, true)) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "coalesced-sibling")
+        val replacement = endpoint.copy(stableId = "replacement-browser")
+        add(registry, sibling)
+        add(registry, replacement)
+        val storage = Storage()
+        val firstGrant = CompletableDeferred<CloudflareAccessSession>()
+        val replacementGrant = CompletableDeferred<CloudflareAccessSession>()
+        val dispatchers = List(2) { PausingDispatcher(StandardTestDispatcher(testScheduler)) }
+        val failure = SSLHandshakeException("test-only completed shared failure")
+        var prompts = 0
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+            val grant = if (++prompts == 1) firstGrant else replacementGrant
+            open("https://example.cloudflareaccess.com/login")
+            grant.await()
+          })
+        val first = async(dispatchers[0]) { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }
+        runCurrent()
+        val oldLaunch = checkNotNull(owner.presentation.value.browserLaunch)
+        val second = async(dispatchers[1]) { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } } }
+        runCurrent()
+        assertEquals(1, prompts)
+        var fresh: Job? = null
+        try {
+          dispatchers.forEach { it.paused = true }
+          firstGrant.completeExceptionally(failure)
+          runCurrent()
+          assertFalse(first.isCompleted)
+          assertFalse(second.isCompleted)
+          assertEquals(oldLaunch, owner.presentation.value.browserLaunch)
+          val replacementWaiter = async { owner.prepare(replacement, tls.copy(stableId = replacement.stableId), true, owner.admissionCheckpoint()) { true } }
+          fresh = replacementWaiter
+          runCurrent()
+          val presentation = owner.presentation.value
+          val currentLaunch = checkNotNull(presentation.browserLaunch)
+          assertTrue(currentLaunch.attemptId != oldLaunch.attemptId)
+          assertEquals(replacement.stableId, presentation.attention?.stableId)
+          assertEquals(2, prompts)
+          for (index in if (reverse) listOf(1, 0) else listOf(0, 1)) {
+            dispatchers[index].resume()
+            runCurrent()
+            assertTlsFailure(failure, listOf(first, second)[index].await().exceptionOrNull())
+            assertEquals(presentation, owner.presentation.value)
+            assertNull(owner.consumeBrowserLaunch(oldLaunch.attemptId))
+            assertNull(owner.cancel(oldLaunch.attemptId))
+            assertEquals(presentation, owner.presentation.value)
+          }
+          val session = CloudflareAccessTestTokens.session("replacement-subject")
+          replacementGrant.complete(session)
+          val lease = checkNotNull(replacementWaiter.await())
+          lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+          val persisted = CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin]))
+          assertEquals(session.subject, persisted.subject)
+          assertEquals(application, persisted.application)
+          assertNull(owner.presentation.value.browserLaunch)
+          assertNull(owner.presentation.value.attention)
+        } finally {
+          dispatchers.forEach { it.resume() }
+          first.cancelAndJoin()
+          second.cancelAndJoin()
+          fresh?.cancelAndJoin()
+        }
+      }
+    }
+
+  @Test fun differentApplicationsReplaceBrowserOwnershipWithoutAdmittingALateGrant() =
+    runTest {
+      for (sameProfile in listOf(false, true)) {
+        for (differentIssuer in listOf(false, true)) {
+          val other = if (differentIssuer) application.copy(issuer = CloudflareAccessJWT.issuer("other.cloudflareaccess.com")) else application.copy(audience = "other-audience")
+          val registry = registry()
+          val replacement = if (sameProfile) endpoint else GatewayEndpoint.manual(endpoint.host, endpoint.port, true, "/other/socket")
+          if (!sameProfile) add(registry, replacement)
+          val storage = Storage()
+          val firstGrant = CompletableDeferred<CloudflareAccessSession>()
+          val secondGrant = CompletableDeferred<CloudflareAccessSession>()
+          val requested = mutableListOf<CloudflareAccessApplication>()
+          val probes = mutableListOf<String>()
+          var useReplacement = false
+          val owner =
+            GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { target, _ ->
+              client({ if (useReplacement && target.stableId == replacement.stableId) other else application }) { request ->
+                probes += request.url.toString()
+                request.header("Cf-Access-Token") == null
+              }
+            }, authenticate = { descriptor, open ->
+              requested += descriptor
+              open("https://${descriptor.issuer.host}/login")
+              if (descriptor == application) withContext(NonCancellable) { firstGrant.await() } else secondGrant.await()
+            })
+          val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }
+          var second: Deferred<GatewayIngressAuthorization?>? = null
+          try {
+            runCurrent()
+            val oldLaunch = checkNotNull(owner.presentation.value.browserLaunch)
+            assertEquals(listOf(application), requested)
+            useReplacement = true
+            val replacementWaiter = async { owner.prepare(replacement, tls.copy(stableId = replacement.stableId), true, owner.admissionCheckpoint()) { true } }
+            second = replacementWaiter
+            runCurrent()
+            assertEquals(listOf(application, other), requested)
+            val presentation = owner.presentation.value
+            assertEquals(replacement.stableId, presentation.attention?.stableId)
+            assertTrue(checkNotNull(presentation.browserLaunch).attemptId != oldLaunch.attemptId)
+            assertNull(owner.cancel(oldLaunch.attemptId))
+            assertNull(owner.consumeBrowserLaunch(oldLaunch.attemptId))
+            assertEquals(presentation, owner.presentation.value)
+            val session = sessionFor(other)
+            secondGrant.complete(session)
+            val lease = checkNotNull(replacementWaiter.await())
+            val encoded = checkNotNull(storage.values[application.origin])
+            assertEquals(other, CloudflareAccessSession.decode(encoded).application)
+            firstGrant.complete(CloudflareAccessTestTokens.session())
+            assertTrue(first.await().exceptionOrNull() is CancellationException)
+            assertEquals(encoded, storage.values[application.origin])
+            lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+            assertNull(owner.presentation.value.attention)
+            assertNull(owner.presentation.value.browserLaunch)
+            assertTrue(probes.any { it.endsWith(endpoint.contextPath) })
+            assertTrue(probes.any { it.endsWith(replacement.contextPath) })
+          } finally {
+            firstGrant.complete(CloudflareAccessTestTokens.session())
+            first.cancelAndJoin()
+            second?.cancelAndJoin()
+          }
+        }
+      }
+    }
+
+  @Test fun aDifferentPathApplicationCanAcceptTheCachedTokenThroughItsPolicyProbe() =
+    runTest {
+      val registry = registry()
+      val replacement = GatewayEndpoint.manual(endpoint.host, endpoint.port, true, "/linked/socket")
+      add(registry, replacement)
+      val storage = Storage()
+      storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
+      val other = application.copy(audience = "linked-audience")
+      val probes = mutableListOf<Request>()
+      val owner =
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ ->
+          client({ other }) { request ->
+            probes += request
+            request.header("Cf-Access-Token") == null
+          }
+        }, authenticate = { _, _ -> error("Policy-accepted cached token must not prompt") })
+      val lease = checkNotNull(owner.prepare(replacement, tls.copy(stableId = replacement.stableId), false, owner.admissionCheckpoint()) { true })
+      assertEquals(2, probes.size)
+      assertEquals(listOf("/linked/socket", "/linked/socket"), probes.map { it.url.encodedPath })
+      assertNull(probes[0].header("Cf-Access-Token"))
+      assertNotNull(probes[1].header("Cf-Access-Token"))
+      lease.requireCurrent(probes.last())
+      assertEquals(application, CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).application)
+      assertNull(owner.presentation.value.browserLaunch)
     }
 
   @Test fun delayedCoalescedWaitersCannotSettleAReplacementBrowserIntent() =

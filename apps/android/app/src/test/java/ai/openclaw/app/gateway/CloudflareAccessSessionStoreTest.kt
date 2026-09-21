@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
@@ -573,6 +574,55 @@ class CloudflareAccessSessionStoreTest {
       assertTrue(store.withCurrentRetirement(finalRetirement, publish))
       assertEquals(2, publications)
       assertNull(storage.values[application.origin])
+    }
+
+  @Test fun replacingAnApplicationPublishesBeforeReentrantCancellationAndNeverStartsASupersededTask() =
+    runTest {
+      val storage = Storage()
+      val ownedJob = SupervisorJob()
+      val scope = CoroutineScope(ownedJob + Dispatchers.Unconfined)
+      val firstGrant = CompletableDeferred<CloudflareAccessSession>()
+      val replacement = application.copy(audience = "replacement-audience")
+      val newest = application.copy(audience = "newest-audience")
+      val started = mutableListOf<CloudflareAccessApplication>()
+      val store =
+        CloudflareAccessSessionStore(scope, storage.persistence, authenticate = { descriptor, _ ->
+          started += descriptor
+          if (descriptor == application) firstGrant.await() else sessionFor(descriptor)
+        }, retireTransports = {})
+      val monitor =
+        checkNotNull(
+          CloudflareAccessSessionStore::class.java
+            .getDeclaredField("lock")
+            .apply { isAccessible = true }
+            .get(store),
+        )
+      var current: Deferred<CloudflareAccessSessionStore.Snapshot>? = null
+      var callbacks = 0
+      try {
+        val first = store.signIn(application) {}
+        assertEquals(listOf(application), started)
+        first.invokeOnCompletion {
+          callbacks++
+          assertFalse(Thread.holdsLock(monitor))
+          // B must already own the slot when A's synchronous cancellation installs C.
+          // Canceling B before its LAZY start must leave only C's authentication live.
+          current = store.signIn(newest) {}
+        }
+        val superseded = store.signIn(replacement) {}
+        assertTrue(first.isCancelled)
+        assertTrue(superseded.isCancelled)
+        assertEquals(1, callbacks)
+        assertEquals(listOf(application, newest), started)
+        val snapshot = checkNotNull(current).await()
+        assertEquals(newest, snapshot.session.application)
+        assertSame(snapshot, store.snapshot(application.origin))
+        assertEquals(newest, CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).application)
+        assertEquals(listOf("delete", "save"), storage.events)
+      } finally {
+        firstGrant.cancel()
+        ownedJob.cancelAndJoin()
+      }
     }
 
   @Test fun unconfinedStartCancellationAndRetirementRunOutsideStoreMonitor() =

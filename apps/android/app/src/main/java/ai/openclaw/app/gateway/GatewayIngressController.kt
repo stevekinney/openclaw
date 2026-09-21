@@ -88,6 +88,7 @@ internal class GatewayIngressController(
 
   private class BrowserIntent(
     val id: UUID,
+    val application: CloudflareAccessApplication,
     val registration: Registration,
     val isCurrent: () -> Boolean,
   ) {
@@ -626,14 +627,23 @@ internal class GatewayIngressController(
   ): CloudflareAccessSessionStore.Snapshot {
     val (intent, task) =
       browserMutex.withLock {
-        val old = synchronized(lock) { browserIntent }
-        if (old != null && synchronized(lock) { !isLiveIntentLocked(old) || old.registration.origin != registration.origin }) cancelExisting(old)
+        checkRegistration(registration, isCurrent)
+        val reusable =
+          synchronized(lock) {
+            checkRegistrationLocked(registration, isCurrent)
+            browserIntent?.takeIf { isLiveIntentLocked(it) && it.application == application }?.let { intent ->
+              intent.task?.takeUnless { it.isCompleted }?.let { intent to it }
+            }
+          }
+        // Capture one attempt and its task. Reacquiring from Store after this check
+        // could attach a fresh task to an intent whose old waiters have not resumed.
+        if (reusable != null) return@withLock reusable
+        synchronized(lock) { browserIntent }?.let { cancelExisting(it) }
         checkRegistration(registration, isCurrent)
         val intent =
           synchronized(lock) {
             checkRegistrationLocked(registration, isCurrent)
-            browserIntent?.takeIf { it.registration.origin == registration.origin }
-              ?: BrowserIntent(UUID.randomUUID(), registration, isCurrent).also { browserIntent = it }
+            BrowserIntent(UUID.randomUUID(), application, registration, isCurrent).also { browserIntent = it }
           }
         val task =
           store.signIn(application, admissionCheckpoint) { url ->
@@ -661,9 +671,10 @@ internal class GatewayIngressController(
       synchronized(lock) {
         checkRegistrationLocked(registration, isCurrent)
         if (intent.canceled.get()) throw CancellationException("Gateway sign-in canceled")
+        if (result.session.application != application) throw CloudflareAccessException(CloudflareAccessException.Kind.InvalidSession)
         // Completion belongs to the shared intent; any current waiter can settle it
         // even after the caller that originally presented its browser has retired.
-        if (browserIntent === intent) {
+        if (browserIntent === intent && intent.task === task) {
           browserIntent = null
           publishLocked(attention = null, browserLaunch = null)
         }
@@ -681,7 +692,7 @@ internal class GatewayIngressController(
           }
         // A shared task's retired waiter cannot clear the surviving browser owner
         // or publish a retry action for a forgotten/replaced profile.
-        if (browserIntent === intent && !intent.canceled.get() && task.isCompleted && callerCurrent &&
+        if (browserIntent === intent && intent.task === task && !intent.canceled.get() && task.isCompleted && callerCurrent &&
           isRegisteredLocked(registration)
         ) {
           browserIntent = null
