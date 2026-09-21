@@ -879,6 +879,7 @@ src/plugins/doctor-contract-relevance.ts
 src/plugins/doctor-session-route-state-owner-types.ts
 src/plugins/enable.ts
 src/plugins/hardlink-policy.ts
+src/plugins/host-hook-cleanup-result.ts
 src/plugins/host-hook-json.ts
 src/plugins/install-channel-specs.ts
 src/plugins/install-paths.ts
