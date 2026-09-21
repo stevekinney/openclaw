@@ -4785,7 +4785,6 @@ class GatewayIngressControllerTest {
     private val uncaught = ConcurrentLinkedQueue<Throwable>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, error -> uncaught += error })
     private val transports = mutableListOf<IngressTransport>()
-    private val peers = ConcurrentLinkedQueue<WebSocket>()
     private val config = checkNotNull(buildGatewayTlsConfig(targetTls))
     private val client =
       OkHttpClient
@@ -4872,7 +4871,6 @@ class GatewayIngressControllerTest {
                     webSocket: WebSocket,
                     response: Response,
                   ) {
-                    peers += webSocket
                     webSocket.send("""{"type":"event","event":"connect.challenge","payload":{"nonce":"android-test-nonce","ts":1700000000123}}""")
                   }
 
@@ -5001,9 +4999,9 @@ class GatewayIngressControllerTest {
         scope.cancel()
         scope.coroutineContext[Job]?.join()
         if (discoveryEntered.isCompleted) withTimeout(5_000) { discoverySettled.await() }
-        peers.forEach { it.cancel() }
         client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
+        // MockWebServer owns accepted sockets; its server-side peers have no client Call.
         server.shutdown()
         foreign.shutdown()
         assertTrue(uncaught.isEmpty())
