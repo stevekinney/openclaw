@@ -198,18 +198,15 @@ internal class GatewayIngressController(
             previous == null && it.registration == null && it.action.stableId == endpoint.stableId &&
               it.origin == current.origin && isAcknowledgementRegisteredLocked(it)
           }
-        val retired = browserIntent?.takeIf { current !== previous && it.registration === previous }
+        var retired: BrowserIntent? = null
         if (current !== previous) {
-          retired?.canceled?.set(true)
           leases.remove(endpoint.stableId)?.active?.set(false)
           registrations[endpoint.stableId] = current
           // A cold Sign out belongs to the saved entry until its first registration.
           // Bind after Retry validation, and before publication can invalidate that owner.
           acknowledgement?.registration = current
-          publishLocked(
-            attention = mutablePresentation.value.attention.takeUnless { retired != null && it?.attemptId == retired.id },
-            browserLaunch = mutablePresentation.value.browserLaunch.takeUnless { it?.attemptId == retired?.id },
-          )
+          retired = previous?.let(::retireBrowserParticipationLocked)
+          publishLocked()
         }
         current to retired
       }
@@ -487,6 +484,34 @@ internal class GatewayIngressController(
     return finishCancellation(intent, intent.task)
   }
 
+  private fun retireBrowserParticipationLocked(registration: Registration): BrowserIntent? {
+    val intent = browserIntent ?: return null
+
+    fun departed(candidate: Registration): Boolean =
+      candidate.endpoint.stableId == registration.endpoint.stableId &&
+        (candidate === registration || !isRegisteredLocked(candidate))
+    // Ordinary admission can rotate this profile's registration without canceling
+    // its Store task. Explicit departure must also retire that obsolete generation.
+    if (!departed(intent.registration) && intent.participants.none { departed(it.registration) }) return null
+    intent.participants.removeAll { departed(it.registration) }
+    // A profile departure does not own a peer's shared task, including terminal
+    // results whose waiters have not resumed. Only the last explicit owner cancels it.
+    val participant = liveParticipantLocked(intent)
+    if (browserIntent !== intent) return null
+    if (participant == null) intent.canceled.set(true)
+    val presentation = mutablePresentation.value
+    publishLocked(
+      attention =
+        if (presentation.attention?.attemptId == intent.id) {
+          participant?.let { presentation.attention.copy(stableId = it.registration.endpoint.stableId) }
+        } else {
+          presentation.attention
+        },
+      browserLaunch = presentation.browserLaunch.takeUnless { participant == null && it?.attemptId == intent.id },
+    )
+    return intent.takeIf { participant == null }
+  }
+
   private fun finishCancellation(
     intent: BrowserIntent,
     task: Deferred<CloudflareAccessSessionStore.Snapshot>?,
@@ -527,7 +552,6 @@ internal class GatewayIngressController(
       synchronized(lock) {
         context.ensureActive()
         validate()
-        val intent = browserIntent?.takeIf { it.registration.endpoint.stableId == stableId }
         val registration = registrations[stableId]
         val association =
           registry.entries.value
@@ -540,18 +564,18 @@ internal class GatewayIngressController(
           origin
             ?.takeIf { selected -> registry.entries.value.none { it.stableId != stableId && it.accessOrigin == selected.uri.toString() } }
             ?.let(store::reserveForget)
-        intent?.canceled?.set(true)
         leases.remove(stableId)?.active?.set(false)
         registrations.remove(stableId)
         if (retirement == null && association != null) {
           associationFailed = !registry.setAccessOrigin(stableId, null)
         }
+        val intent = registration?.let(::retireBrowserParticipationLocked)
         // Registry observers can reenter after the association commit. A newer
         // registration owns its UI even when it uses the same origin.
         if (registrations[stableId] == null) {
           publishLocked(
             attention = mutablePresentation.value.attention.takeUnless { it?.stableId == stableId },
-            browserLaunch = mutablePresentation.value.browserLaunch.takeUnless { intent != null && it?.attemptId == intent.id },
+            browserLaunch = mutablePresentation.value.browserLaunch,
           )
         }
         Triple(intent, retirement, association)

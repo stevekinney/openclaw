@@ -3950,6 +3950,336 @@ class GatewayIngressControllerTest {
       }
     }
 
+  @Test fun profileDeparturePreservesCoalescedBrowserAndTerminalWaiters() =
+    runTest {
+      for (departure in listOf("forget", "replacement")) {
+        for (stage in listOf("delayed", "queued", "completed-success", "completed-failure")) {
+          for (departCreator in listOf(false, true)) {
+            val registry = registry()
+            val sibling = endpoint.copy(stableId = "surviving-browser-profile")
+            add(registry, sibling)
+            val storage = Storage()
+            val opening = CompletableDeferred<Unit>()
+            val authenticationEntered = CompletableDeferred<Unit>()
+            val grant = CompletableDeferred<CloudflareAccessSession>()
+            val probeEntered = CompletableDeferred<Unit>()
+            val probeRelease = CompletableDeferred<Unit>()
+            val dispatchers = List(2) { PausingDispatcher(StandardTestDispatcher(testScheduler)) }
+            val pending = mutableListOf<Job>()
+            val uncaught = mutableListOf<Throwable>()
+            val ownerJob = SupervisorJob()
+            val ownerScope = CoroutineScope(ownerJob + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
+            val failure = SSLHandshakeException("test-only shared completion failure")
+            var heldRoute: GatewayEndpoint? = null
+            var authentication: Job? = null
+            var prompts = 0
+            if (stage != "delayed") opening.complete(Unit)
+            try {
+              val owner =
+                GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
+                  client { request ->
+                    if (target == heldRoute && request.header("Cf-Access-Token") == null) {
+                      probeEntered.complete(Unit)
+                      probeRelease.await()
+                    }
+                    request.header("Cf-Access-Token") == null
+                  }
+                }, authenticate = { _, open ->
+                  prompts++
+                  authentication = kotlin.coroutines.coroutineContext[Job]
+                  authenticationEntered.complete(Unit)
+                  opening.await()
+                  open("https://example.cloudflareaccess.com/login")
+                  grant.await()
+                })
+              val first = async(dispatchers[0]) { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+              runCurrent()
+              assertTrue(authenticationEntered.isCompleted)
+              val second = async(dispatchers[1]) { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+              runCurrent()
+              assertEquals(1, prompts)
+              assertFalse(first.isCompleted)
+              assertFalse(second.isCompleted)
+              val initialLaunch = owner.presentation.value.browserLaunch
+              val terminal = stage.startsWith("completed")
+              if (terminal) {
+                val launch = checkNotNull(initialLaunch)
+                assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+                assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+                dispatchers.forEach { it.paused = true }
+                if (stage == "completed-failure") grant.completeExceptionally(failure) else grant.complete(CloudflareAccessTestTokens.session("shared-survivor"))
+                runCurrent()
+                assertTrue(checkNotNull(authentication).isCompleted)
+                assertFalse(first.isCompleted)
+                assertFalse(second.isCompleted)
+              }
+              val selected = if (departCreator) endpoint else sibling
+              val survivor = if (departCreator) sibling else endpoint
+              val deletes = storage.deleted.size
+              val taskWasCanceled = checkNotNull(authentication).isCancelled
+              var replacement: Deferred<Result<GatewayIngressAuthorization?>>? = null
+              if (departure == "forget") {
+                owner.forget(selected.stableId)
+              } else {
+                val route = selected.copy(contextPath = "/replacement/socket")
+                heldRoute = route
+                replacement = async { runCatching { owner.prepare(route, tls.copy(stableId = route.stableId), false, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+                runCurrent()
+                assertTrue(probeEntered.isCompleted)
+                assertFalse(replacement.isCompleted)
+              }
+              assertEquals(taskWasCanceled, checkNotNull(authentication).isCancelled)
+              assertEquals(deletes, storage.deleted.size)
+              assertEquals(1, prompts)
+              if (stage != "delayed") {
+                assertEquals(
+                  survivor.stableId,
+                  owner.presentation.value.attention
+                    ?.stableId,
+                )
+                assertEquals(
+                  initialLaunch?.attemptId,
+                  owner.presentation.value.attention
+                    ?.attemptId,
+                )
+              }
+              if (!terminal) {
+                opening.complete(Unit)
+                runCurrent()
+                val launch = checkNotNull(owner.presentation.value.browserLaunch)
+                if (initialLaunch != null) assertEquals(initialLaunch, launch)
+                assertEquals(
+                  survivor.stableId,
+                  owner.presentation.value.attention
+                    ?.stableId,
+                )
+                assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+                assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+                grant.complete(CloudflareAccessTestTokens.session("shared-survivor"))
+              }
+              dispatchers.forEach { it.resume() }
+              val selectedResult = (if (departCreator) first else second).await()
+              val survivorResult = (if (departCreator) second else first).await()
+              if (stage == "completed-failure") {
+                assertTlsFailure(failure, selectedResult.exceptionOrNull())
+                assertTlsFailure(failure, survivorResult.exceptionOrNull())
+                assertEquals(
+                  survivor.stableId,
+                  owner.presentation.value.attention
+                    ?.stableId,
+                )
+                assertTrue(checkNotNull(owner.presentation.value.attention).message.startsWith("TLS connection failed:"))
+                assertNull(storage.values[application.origin])
+              } else {
+                assertTrue(selectedResult.exceptionOrNull() is CancellationException)
+                val lease = checkNotNull(survivorResult.getOrThrow())
+                lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+                assertEquals("shared-survivor", CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).subject)
+                assertNull(owner.presentation.value.attention)
+              }
+              assertNull(owner.presentation.value.browserLaunch)
+              assertEquals(
+                application.origin.uri.toString(),
+                registry.entries.value
+                  .first { it.stableId == survivor.stableId }
+                  .accessOrigin,
+              )
+              replacement?.cancel()
+              probeRelease.complete(Unit)
+              if (replacement != null) assertTrue(runCatching { replacement.await().getOrThrow() }.exceptionOrNull() is CancellationException)
+            } finally {
+              withContext(NonCancellable) {
+                opening.complete(Unit)
+                grant.cancel()
+                probeRelease.complete(Unit)
+                dispatchers.forEach { it.resume() }
+                pending.forEach { it.cancel() }
+                ownerJob.cancel()
+                pending.forEach { it.join() }
+                ownerJob.join()
+                assertTrue(uncaught.isEmpty())
+              }
+            }
+          }
+        }
+      }
+    }
+
+  @Test fun passiveReplacementPreservesPeerUntilAnIncompatibleApplicationSignsIn() =
+    runTest {
+      val registry = registry()
+      val sibling = endpoint.copy(stableId = "previous-application-peer")
+      add(registry, sibling)
+      val replacement = endpoint.copy(contextPath = "/other/socket")
+      val other = application.copy(audience = "replacement-audience")
+      val storage = Storage()
+      val firstGrant = CompletableDeferred<CloudflareAccessSession>()
+      val nextGrant = CompletableDeferred<CloudflareAccessSession>()
+      val probeEntered = CompletableDeferred<Unit>()
+      val probeRelease = CompletableDeferred<Unit>()
+      val applications = mutableListOf<CloudflareAccessApplication>()
+      val pending = mutableListOf<Job>()
+      val uncaught = mutableListOf<Throwable>()
+      val ownerJob = SupervisorJob()
+      val ownerScope = CoroutineScope(ownerJob + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
+      var originalTask: Job? = null
+      try {
+        val owner =
+          GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
+            client({ if (target == replacement) other else application }) { request ->
+              if (target == replacement && request.header("Cf-Access-Token") == null) {
+                probeEntered.complete(Unit)
+                probeRelease.await()
+              }
+              request.header("Cf-Access-Token") == null
+            }
+          }, authenticate = { descriptor, open ->
+            applications += descriptor
+            open("https://example.cloudflareaccess.com/login")
+            if (descriptor == application) {
+              originalTask = kotlin.coroutines.coroutineContext[Job]
+              withContext(NonCancellable) { firstGrant.await() }
+            } else {
+              nextGrant.await()
+            }
+          })
+        val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+        runCurrent()
+        val launch = checkNotNull(owner.presentation.value.browserLaunch)
+        val peer = async { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+        runCurrent()
+        val next = async { owner.prepare(replacement, tls, true, owner.admissionCheckpoint()) { true } }.also(pending::add)
+        runCurrent()
+        assertTrue(probeEntered.isCompleted)
+        assertFalse(checkNotNull(originalTask).isCancelled)
+        assertEquals(listOf(application), applications)
+        assertEquals(launch, owner.presentation.value.browserLaunch)
+        assertEquals(
+          sibling.stableId,
+          owner.presentation.value.attention
+            ?.stableId,
+        )
+        assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+        probeRelease.complete(Unit)
+        runCurrent()
+        assertTrue(checkNotNull(originalTask).isCancelled)
+        assertEquals(listOf(application, other), applications)
+        val currentLaunch = checkNotNull(owner.presentation.value.browserLaunch)
+        assertTrue(currentLaunch.attemptId != launch.attemptId)
+        assertEquals(currentLaunch.url, owner.consumeBrowserLaunch(currentLaunch.attemptId))
+        firstGrant.complete(CloudflareAccessTestTokens.session())
+        assertTrue(first.await().exceptionOrNull() is CancellationException)
+        assertTrue(peer.await().exceptionOrNull() is CancellationException)
+        nextGrant.complete(sessionFor(other))
+        val lease = checkNotNull(next.await())
+        lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+        assertEquals(other, CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).application)
+        assertNull(owner.presentation.value.attention)
+      } finally {
+        withContext(NonCancellable) {
+          firstGrant.complete(CloudflareAccessTestTokens.session())
+          nextGrant.cancel()
+          probeRelease.complete(Unit)
+          pending.forEach { it.cancel() }
+          ownerJob.cancel()
+          pending.forEach { it.join() }
+          ownerJob.join()
+          assertTrue(uncaught.isEmpty())
+        }
+      }
+    }
+
+  @Test fun explicitDepartureRetiresAnOrdinarySuccessorsObsoleteBrowserGeneration() =
+    runTest {
+      for (replace in listOf(false, true)) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "next-browser-profile")
+        add(registry, sibling)
+        val replacement = endpoint.copy(contextPath = "/changed/socket")
+        val probeEntered = CompletableDeferred<Unit>()
+        val probeRelease = CompletableDeferred<Unit>()
+        val storage = Storage()
+        val grant = CompletableDeferred<CloudflareAccessSession>()
+        val pending = mutableListOf<Job>()
+        val uncaught = mutableListOf<Throwable>()
+        val ownerJob = SupervisorJob()
+        val ownerScope = CoroutineScope(ownerJob + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
+        var ordinary = false
+        var authentication: Job? = null
+        var prompts = 0
+        try {
+          val owner =
+            GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
+              client { request ->
+                if (target == replacement) {
+                  probeEntered.complete(Unit)
+                  probeRelease.await()
+                  true
+                } else {
+                  !(target.stableId == endpoint.stableId && ordinary) && request.header("Cf-Access-Token") == null
+                }
+              }
+            }, authenticate = { _, open ->
+              prompts++
+              authentication = kotlin.coroutines.coroutineContext[Job]
+              open("https://example.cloudflareaccess.com/login")
+              grant.await()
+            })
+          val old = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } } }.also(pending::add)
+          runCurrent()
+          val launch = checkNotNull(owner.presentation.value.browserLaunch)
+          ordinary = true
+          assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+          assertFalse(checkNotNull(authentication).isCancelled)
+          assertFalse(old.isCompleted)
+          assertNull(owner.presentation.value.browserLaunch)
+          assertNull(owner.presentation.value.attention)
+          assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+          val automatic =
+            if (replace) {
+              async { runCatching { owner.prepare(replacement, tls, false, owner.admissionCheckpoint()) { true } } }.also(pending::add).also {
+                runCurrent()
+                assertTrue(probeEntered.isCompleted)
+                assertFalse(it.isCompleted)
+              }
+            } else {
+              owner.forget(endpoint.stableId)
+              null
+            }
+          assertTrue(checkNotNull(authentication).isCancelled)
+          assertTrue(old.await().exceptionOrNull() is CancellationException)
+          assertNull(storage.values[application.origin])
+          val result =
+            if (automatic != null) {
+              probeRelease.complete(Unit)
+              automatic.await()
+            } else {
+              assertNull(
+                registry.entries.value
+                  .first { it.stableId == endpoint.stableId }
+                  .accessOrigin,
+              )
+              runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true } }
+            }
+          assertTrue(result.exceptionOrNull() is GatewayExternalAuthorizationException)
+          assertEquals(if (replace) endpoint.stableId else sibling.stableId, checkNotNull(owner.presentation.value.attention).stableId)
+          assertTrue(checkNotNull(owner.presentation.value.attention).message.startsWith("Sign in to Cloudflare Access"))
+          assertNull(owner.presentation.value.browserLaunch)
+          assertEquals(1, prompts)
+        } finally {
+          withContext(NonCancellable) {
+            grant.cancel()
+            probeRelease.complete(Unit)
+            pending.forEach { it.cancel() }
+            ownerJob.cancel()
+            pending.forEach { it.join() }
+            ownerJob.join()
+            assertTrue(uncaught.isEmpty())
+          }
+        }
+      }
+    }
+
   @Test fun browserEligibilityEndsWithParticipantsAndExplicitCancelTargetsTheSurvivor() =
     runTest {
       for (retireAll in listOf(false, true)) {
