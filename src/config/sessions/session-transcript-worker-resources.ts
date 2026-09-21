@@ -395,6 +395,7 @@ export async function withSessionHistoryWorkerReadCandidates<T>(
             | "session-title-fields"
             | "session-row-presence"
             | "session-members"
+            | "session-membership-facts"
             | "session-entry-list"
             | "session-exact-entries"
             | "session-store-target"
