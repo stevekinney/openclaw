@@ -47,6 +47,7 @@ import org.robolectric.RuntimeEnvironment
 import java.lang.management.ManagementFactory
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLHandshakeException
@@ -127,6 +128,7 @@ class GatewayIngressControllerTest {
 
   private fun client(
     descriptor: () -> CloudflareAccessApplication = { application },
+    loginRedirect: Boolean = false,
     probe: suspend (Request) -> Boolean = { it.header("Cf-Access-Token") == null },
   ): CloudflareAccessClient =
     CloudflareAccessClient { request, _, _ ->
@@ -155,7 +157,13 @@ class GatewayIngressControllerTest {
         else -> {
           val challenged = probe(request)
           val headers = Headers.Builder()
-          if (challenged) headers.add("WWW-Authenticate", "Cloudflare-Access resource_metadata=\"${application.origin.uri}/.well-known/cloudflare-access-protected-resource/gateway/socket\"")
+          if (challenged) {
+            if (loginRedirect) {
+              headers.add("Location", "https://login.example.test/cdn-cgi/access/login?opaque=ignored")
+            } else {
+              headers.add("WWW-Authenticate", "Cloudflare-Access resource_metadata=\"${application.origin.uri}/.well-known/cloudflare-access-protected-resource/gateway/socket\"")
+            }
+          }
           CloudflareAccessClient.Reply(request.url.toString(), if (challenged) 302 else 200, headers.build(), byteArrayOf())
         }
       }
@@ -174,12 +182,198 @@ class GatewayIngressControllerTest {
     return CloudflareAccessSession(application, "replacement", expires, CloudflareAccessTestTokens.token(claims))
   }
 
+  @Test fun registryPublicationNeverEntersIngressInline() =
+    runTest {
+      val context = RuntimeEnvironment.getApplication()
+      val prefs = SecurePrefs(context, context.getSharedPreferences("access-observer-${UUID.randomUUID()}", Context.MODE_PRIVATE))
+      val registry = GatewayRegistryStore(prefs).also { add(it, endpoint) }
+      val ownerScope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+      val owner = GatewayIngressController(ownerScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler))
+      val enteredIngress = CountDownLatch(1)
+      val releaseIngress = CountDownLatch(1)
+      val written = CountDownLatch(1)
+      val failures = ConcurrentLinkedQueue<Throwable>()
+      val admission =
+        Thread({
+          try {
+            val failure =
+              runCatching {
+                runBlocking {
+                  owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) {
+                    enteredIngress.countDown()
+                    releaseIngress.await()
+                    false
+                  }
+                }
+              }.exceptionOrNull()
+            check(failure is CancellationException)
+          } catch (error: Throwable) {
+            failures += error
+          }
+        }, "access-ingress-monitor-test").apply { isDaemon = true }
+      val writer =
+        Thread({
+          try {
+            check(registry.setAccessOrigin(endpoint.stableId, application.origin))
+          } catch (error: Throwable) {
+            failures += error
+          } finally {
+            written.countDown()
+          }
+        }, "access-registry-publish-test").apply { isDaemon = true }
+      try {
+        runCurrent() // Subscribe before the Registry setter attempts to resume this observer.
+        admission.start()
+        assertTrue("Admission did not acquire ingress", enteredIngress.await(5, TimeUnit.SECONDS))
+        writer.start()
+        // This timeout is a harness watchdog. The event must occur while the ingress gate stays closed.
+        assertTrue("Registry publication waited for ingress", written.await(5, TimeUnit.SECONDS))
+        assertEquals(1L, releaseIngress.count)
+        releaseIngress.countDown()
+        admission.join(5000)
+        writer.join(5000)
+        runCurrent()
+        assertTrue(failures.isEmpty())
+        assertTrue(
+          owner.presentation.value.browserRequired
+            .contains(endpoint.stableId),
+        )
+        assertEquals(
+          application.origin.uri.toString(),
+          GatewayRegistryStore(prefs)
+            .entries.value
+            .single()
+            .accessOrigin,
+        )
+      } finally {
+        // Returning false prevents the held admission from acquiring Registry even on the old failing path.
+        releaseIngress.countDown()
+        admission.join(5000)
+        writer.join(5000)
+        ownerScope.cancel()
+        runCurrent()
+        ownerScope.coroutineContext[Job]?.join()
+        assertFalse("Admission worker leaked", admission.isAlive)
+        assertFalse("Registry worker leaked", writer.isAlive)
+      }
+    }
+
+  @Test fun registryObservationKeepsInitialStateAndStopsBeforeQueuedPublication() =
+    runTest {
+      val registry = registry()
+      assertTrue(registry.setAccessOrigin(endpoint.stableId, application.origin))
+      val ownerScope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+      val owner = GatewayIngressController(ownerScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler))
+      val initial = owner.presentation.value
+      assertEquals(setOf(endpoint.stableId), initial.browserRequired)
+      try {
+        runCurrent()
+        assertTrue(registry.setAccessOrigin(endpoint.stableId, null))
+        ownerScope.cancel()
+        runCurrent()
+        ownerScope.coroutineContext[Job]?.join()
+        assertEquals(initial, owner.presentation.value)
+        assertNull(
+          registry.entries.value
+            .single()
+            .accessOrigin,
+        )
+      } finally {
+        ownerScope.cancel()
+        runCurrent()
+        ownerScope.coroutineContext[Job]?.join()
+      }
+    }
+
+  @Test fun headerlessLoginRedirectsPreserveAdmissionAndRejectRevokedGrants() =
+    runTest {
+      for (rejection in listOf("prepare", "upgrade", "response")) {
+        val registry = registry()
+        val storage = Storage()
+        var ordinary = true
+        var revoked = false
+        var prompts = 0
+        val grant = CompletableDeferred<CloudflareAccessSession>()
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
+            client(loginRedirect = true) { !ordinary && (revoked || it.header("Cf-Access-Token") == null) }
+          }, authenticate = { _, open ->
+            prompts++
+            open("https://example.cloudflareaccess.com/login")
+            grant.await()
+          })
+        assertNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+        assertNull(owner.presentation.value.attention)
+        assertEquals(0, prompts)
+        ordinary = false
+        assertTrue(runCatching { owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true } }.exceptionOrNull() is GatewayExternalAuthorizationException)
+        assertEquals(
+          endpoint.stableId,
+          owner.presentation.value.attention
+            ?.stableId,
+        )
+        assertNull(owner.presentation.value.browserLaunch)
+        assertEquals(0, prompts)
+        val pending = async { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } }
+        try {
+          runCurrent()
+          val launch = checkNotNull(owner.presentation.value.browserLaunch)
+          assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+          grant.complete(CloudflareAccessTestTokens.session())
+          val current = checkNotNull(pending.await())
+          val request = Request.Builder().url(application.origin.uri.toString()).build()
+          current.requireCurrent(request)
+          val cached = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
+          assertNotNull(cached.authorizeUpgrade(request).header("Cf-Access-Token"))
+          assertEquals(1, prompts)
+          assertNull(owner.presentation.value.attention)
+          revoked = true
+          if (rejection == "response") {
+            val response =
+              okhttp3.Response
+                .Builder()
+                .request(request)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(302)
+                .message("Found")
+                .header("Location", "https://login.example.test/cdn-cgi/access/login?opaque=ignored")
+                .build()
+            assertNotNull(cached.rejection(response))
+          } else {
+            val failure =
+              runCatching {
+                if (rejection == "prepare") {
+                  owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
+                } else {
+                  cached.authorizeUpgrade(request)
+                }
+              }.exceptionOrNull()
+            assertTrue(failure is GatewayExternalAuthorizationException)
+          }
+          runCurrent()
+          assertTrue(runCatching { cached.requireCurrent(request) }.exceptionOrNull() is GatewayExternalAuthorizationException)
+          assertEquals(
+            endpoint.stableId,
+            owner.presentation.value.attention
+              ?.stableId,
+          )
+          assertNull(owner.presentation.value.browserLaunch)
+          assertEquals(1, prompts)
+          owner.forget(endpoint.stableId)
+          assertNull(storage.values[application.origin])
+        } finally {
+          grant.cancel()
+          pending.cancelAndJoin()
+        }
+      }
+    }
+
   @Test fun ordinaryAndServiceHeaderRoutesNeverPresentBrowser() =
     runTest {
       val registry = registry()
       var prompts = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { mapOf("Cf-Access-Client-Id" to "service-id") }, {}, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { mapOf("Cf-Access-Client-Id" to "service-id") }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client {
             assertEquals("service-id", it.header("Cf-Access-Client-Id"))
             false
@@ -197,7 +391,7 @@ class GatewayIngressControllerTest {
   @Test fun automaticChallengeIsActionableWithoutBrowser() =
     runTest {
       val registry = registry()
-      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       assertTrue(runCatching { owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true } }.exceptionOrNull() is GatewayExternalAuthorizationException)
       assertEquals(
         endpoint.stableId,
@@ -217,7 +411,7 @@ class GatewayIngressControllerTest {
     runTest {
       val registry = registry()
       var challenged = false
-      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client { challenged } })
+      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { challenged } })
       assertNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
       assertFalse(owner.blocksAutomaticReconnect(endpoint.stableId))
       challenged = true
@@ -240,7 +434,7 @@ class GatewayIngressControllerTest {
       var probes = 0
       var prompts = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { target, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
           client {
             probes++
             gate.await()
@@ -274,7 +468,7 @@ class GatewayIngressControllerTest {
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
       val requests = mutableListOf<Request>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { mapOf("Cf-Access-Client-Id" to "service-id") }, {}, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { mapOf("Cf-Access-Client-Id" to "service-id") }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client {
             requests += it
             false
@@ -295,7 +489,7 @@ class GatewayIngressControllerTest {
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
       val requests = mutableListOf<Request>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client {
             requests += it
             it.header("Cf-Access-Token") == null
@@ -313,7 +507,7 @@ class GatewayIngressControllerTest {
       val storage = Storage()
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
       val retirement = CompletableDeferred<Unit>()
-      val owner = GatewayIngressController(backgroundScope, registry(), storage.persistence, { emptyMap() }, { retirement.await() }, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry(), storage.persistence, { emptyMap() }, { retirement.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val first = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
       val second = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
       val request = Request.Builder().url(application.origin.uri.toString()).build()
@@ -348,7 +542,7 @@ class GatewayIngressControllerTest {
             storage.persistence.delete(origin)
           },
         )
-      owner = GatewayIngressController(backgroundScope, registry(), persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() })
+      owner = GatewayIngressController(backgroundScope, registry(), persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val lease = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
       val stopped = checkNotNull(owner.signOut(endpoint.stableId))
       try {
@@ -381,7 +575,7 @@ class GatewayIngressControllerTest {
       val encoded = CloudflareAccessTestTokens.session().encode()
       storage.values[application.origin] = encoded
       val drain = CompletableDeferred<Unit>()
-      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() })
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler))
       val stopped = checkNotNull(owner.signOut(endpoint.stableId))
       try {
         runCurrent()
@@ -422,7 +616,7 @@ class GatewayIngressControllerTest {
             val owner =
               GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, {
                 if (++drainCount == 1) firstDrain.await() else secondDrain.await()
-              }, clientForRoute = { _, _ -> client { false } })
+              }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { false } })
             try {
               if (ordinarySibling) {
                 assertNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true })
@@ -511,7 +705,7 @@ class GatewayIngressControllerTest {
             val supervisor = SupervisorJob()
             val scope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
             val owner =
-              GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+              GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
                 prompts += 1
                 open("https://example.cloudflareaccess.com/login")
                 approved.await()
@@ -584,7 +778,7 @@ class GatewayIngressControllerTest {
         val drain = CompletableDeferred<Unit>()
         var prompts = 0
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, _ ->
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, _ ->
             prompts += 1
             CloudflareAccessTestTokens.session()
           })
@@ -636,7 +830,7 @@ class GatewayIngressControllerTest {
         val supervisor = SupervisorJob()
         val scope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught += error })
         val owner =
-          GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { target, _ ->
+          GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
             client { request ->
               if (target == replacement) {
                 entered = true
@@ -694,7 +888,7 @@ class GatewayIngressControllerTest {
         val drain = CompletableDeferred<Unit>()
         var ordinary = false
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ ->
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
             client { !ordinary && it.header("Cf-Access-Token") == null }
           })
         assertNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
@@ -737,7 +931,7 @@ class GatewayIngressControllerTest {
       val release = CompletableDeferred<Unit>()
       var holdProbe = false
       val owner =
-        GatewayIngressController(backgroundScope, registry(), storage.persistence, { emptyMap() }, { retirement.await() }, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry(), storage.persistence, { emptyMap() }, { retirement.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client {
             if (it.header("Cf-Access-Token") == null) {
               true
@@ -811,7 +1005,7 @@ class GatewayIngressControllerTest {
           delete = storage.persistence.delete,
         )
       owner =
-        GatewayIngressController(ownerScope, registry, persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(ownerScope, registry, persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           grant.await()
         })
@@ -863,7 +1057,7 @@ class GatewayIngressControllerTest {
             if (++retirements == 1) {
               fresh = ownerScope.async { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { true } }
             }
-          }, now = { now }, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          }, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
             open("https://example.cloudflareaccess.com/login")
             grant.await()
           })
@@ -916,7 +1110,7 @@ class GatewayIngressControllerTest {
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
       var ordinary = false
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client { !ordinary && it.header("Cf-Access-Token") == null }
         })
       val old = checkNotNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
@@ -951,7 +1145,7 @@ class GatewayIngressControllerTest {
         }
         val replacement = endpoint.copy(host = "ordinary.example.test")
         add(registry, replacement)
-        val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client { false } })
+        val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { false } })
         assertNull(owner.prepare(replacement, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
         assertNull(
           registry.entries.value
@@ -989,7 +1183,7 @@ class GatewayIngressControllerTest {
             entered = true
             release.await()
             if (failure == "drain") throw java.io.IOException("Old origin drain failed")
-          }, clientForRoute = { _, _ ->
+          }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
             client {
               probes++
               false
@@ -1035,7 +1229,7 @@ class GatewayIngressControllerTest {
           assertNotNull(restoredStore.snapshot(application.origin))
           val coldRegistry = restoredRegistry()
           val retired = mutableListOf<CloudflareAccessOrigin>()
-          val cold = GatewayIngressController(backgroundScope, coldRegistry, storage.persistence, { emptyMap() }, { retired += it }, clientForRoute = { _, _ -> client { false } })
+          val cold = GatewayIngressController(backgroundScope, coldRegistry, storage.persistence, { emptyMap() }, { retired += it }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { false } })
           if (failure == "delete") {
             cold.forget(endpoint.stableId)
             assertTrue(coldRegistry.remove(endpoint.stableId))
@@ -1074,7 +1268,7 @@ class GatewayIngressControllerTest {
         GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {
           retirements++
           release.await()
-        }, clientForRoute = { _, _ -> client { false } })
+        }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { false } })
       val replacement = endpoint.copy(host = "replacement.example.test")
       val siblingReplacement = sibling.copy(host = "sibling.example.test")
       var second: Deferred<Result<GatewayIngressAuthorization?>>? = null
@@ -1130,7 +1324,7 @@ class GatewayIngressControllerTest {
               2 -> secondDrain.await()
               else -> error("Unexpected retirement")
             }
-          }, clientForRoute = { target, _ ->
+          }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
             client {
               probes += target.host
               false
@@ -1261,7 +1455,7 @@ class GatewayIngressControllerTest {
         owner =
           GatewayIngressController(scope, registry, persistence, { emptyMap() }, {
             if (retirements.incrementAndGet() == 1) release.await()
-          }, clientForRoute = { target, _ -> client { target.host != departing.host && it.header("Cf-Access-Token") == null } }, authenticate = { _, _ -> CloudflareAccessTestTokens.session("fresh") })
+          }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ -> client { target.host != departing.host && it.header("Cf-Access-Token") == null } }, authenticate = { _, _ -> CloudflareAccessTestTokens.session("fresh") })
         checkpoint = owner.admissionCheckpoint()
         try {
           val store =
@@ -1328,7 +1522,7 @@ class GatewayIngressControllerTest {
       val grant = CompletableDeferred<CloudflareAccessSession>()
       var prompts = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           prompts++
           open("https://example.cloudflareaccess.com/login")
           grant.await()
@@ -1364,7 +1558,7 @@ class GatewayIngressControllerTest {
       val grant = CompletableDeferred<CloudflareAccessSession>()
       var calls = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           calls++
           open("https://example.cloudflareaccess.com/login")
           if (calls == 1) withContext(NonCancellable) { grant.await() } else CloudflareAccessTestTokens.session("replacement")
@@ -1390,7 +1584,7 @@ class GatewayIngressControllerTest {
       storage.values[application.origin] = CloudflareAccessTestTokens.session(expires = now + 1).encode()
       val probe = CompletableDeferred<Unit>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, now = { now }, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client {
             if (it.header("Cf-Access-Token") == null) return@client true
             probe.await()
@@ -1413,7 +1607,7 @@ class GatewayIngressControllerTest {
       val grant = CompletableDeferred<CloudflareAccessSession>()
       val waiter = PausingDispatcher(StandardTestDispatcher(testScheduler))
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           grant.await()
         })
@@ -1443,7 +1637,7 @@ class GatewayIngressControllerTest {
       val registry = registry()
       val grant = CompletableDeferred<CloudflareAccessSession>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           grant.await()
         })
@@ -1466,7 +1660,7 @@ class GatewayIngressControllerTest {
       val grant = CompletableDeferred<CloudflareAccessSession>()
       val waiter = PausingDispatcher(StandardTestDispatcher(testScheduler))
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           grant.await()
         })
@@ -1522,7 +1716,7 @@ class GatewayIngressControllerTest {
         val sibling = endpoint.copy(stableId = "association-sibling")
         add(registry, sibling)
         registry.setAccessOrigin(sibling.stableId, application.origin)
-        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() })
+        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
         var armed = true
         var observed = false
         val observer =
@@ -1558,7 +1752,7 @@ class GatewayIngressControllerTest {
         add(registry, sibling)
         registry.setAccessOrigin(sibling.stableId, application.origin)
         val owner =
-          GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
             open("https://example.cloudflareaccess.com/login")
             CompletableDeferred<CloudflareAccessSession>().await()
           })
@@ -1599,7 +1793,7 @@ class GatewayIngressControllerTest {
       val registry = registry()
       var authentications = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           authentications++
           open("https://example.cloudflareaccess.com/login")
           CompletableDeferred<CloudflareAccessSession>().await()
@@ -1629,7 +1823,7 @@ class GatewayIngressControllerTest {
   @Test fun consumingLaunchRechecksOwnerAfterInlineCancellation() =
     runTest {
       val owner =
-        GatewayIngressController(backgroundScope, registry(), Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry(), Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           CompletableDeferred<CloudflareAccessSession>().await()
         })
@@ -1669,7 +1863,7 @@ class GatewayIngressControllerTest {
             nested = true
             owner.signOut(sibling.stableId)
           }
-        }, clientForRoute = { _, _ -> client() })
+        }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       try {
         owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
         owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true }
@@ -1694,7 +1888,7 @@ class GatewayIngressControllerTest {
     runTest {
       for (retirement in listOf("forget", "replacement", "sign-out", "caller")) {
         val registry = registry()
-        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() })
+        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
         assertTrue(runCatching { owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true } }.exceptionOrNull() is GatewayExternalAuthorizationException)
         var current = true
         val reporter = checkNotNull(owner.retry(owner.admissionCheckpoint()) { current })
@@ -1723,7 +1917,7 @@ class GatewayIngressControllerTest {
       val registry = registry()
       registry.setAccessOrigin(endpoint.stableId, application.origin)
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           CompletableDeferred<CloudflareAccessSession>().await()
         })
@@ -1769,7 +1963,7 @@ class GatewayIngressControllerTest {
             val uncaught = mutableListOf<Throwable>()
             val ownerScope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> uncaught.add(error) })
             val owner =
-              GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+              GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
                 open("https://example.cloudflareaccess.com/login")
                 approved.await()
               })
@@ -1833,7 +2027,7 @@ class GatewayIngressControllerTest {
       val drain = CompletableDeferred<Unit>()
       val approved = CompletableDeferred<CloudflareAccessSession>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           approved.await()
         })
@@ -1870,7 +2064,7 @@ class GatewayIngressControllerTest {
       val sibling = endpoint.copy(stableId = "ordinary-retry-sibling")
       add(registry, sibling)
       registry.setAccessOrigin(endpoint.stableId, application.origin)
-      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { target, _ -> client { target.stableId != sibling.stableId } })
+      val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ -> client { target.stableId != sibling.stableId } })
       checkNotNull(owner.signOut(endpoint.stableId)).await()
       val checkpoint = owner.admissionCheckpoint()
       val queued = checkNotNull(owner.retry(checkpoint) { true })
@@ -1887,7 +2081,7 @@ class GatewayIngressControllerTest {
     runTest {
       val registry = registry()
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           CompletableDeferred<CloudflareAccessSession>().await()
         })
@@ -1921,7 +2115,7 @@ class GatewayIngressControllerTest {
       val replacement = endpoint.copy(host = "replacement.example.test")
       var fail = true
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { target, _ ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
           if (target.host == replacement.host) {
             CloudflareAccessClient { request, _, _ ->
               if (fail) throw java.io.IOException("Replacement discovery failed")
@@ -1969,7 +2163,7 @@ class GatewayIngressControllerTest {
         val grant = CompletableDeferred<CloudflareAccessSession>()
         val waiter = PausingDispatcher(StandardTestDispatcher(testScheduler))
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
             open("https://example.cloudflareaccess.com/login")
             grant.await()
           })
@@ -2055,7 +2249,7 @@ class GatewayIngressControllerTest {
         var secondCurrent = true
         var authentications = 0
         val owner =
-          GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          GatewayIngressController(ownerScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
             authentications++
             open("https://example.cloudflareaccess.com/login")
             grant.await()
@@ -2137,7 +2331,7 @@ class GatewayIngressControllerTest {
       var now = System.currentTimeMillis() / 1000.0
       var retirements = 0
       storage.values[application.origin] = CloudflareAccessTestTokens.session(expires = now + 1).encode()
-      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val first = checkNotNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
       val last = checkNotNull(owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
       val request = Request.Builder().url(application.origin.uri.toString()).build()
@@ -2166,7 +2360,7 @@ class GatewayIngressControllerTest {
           val encoded = CloudflareAccessTestTokens.session(expires = now + 1).encode()
           storage.values[application.origin] = encoded
           storage.deleteSucceeds = failDrain
-          val owner = GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { if (failDrain) throw java.io.IOException("test-only drain failure") }, now = { now }, clientForRoute = { _, _ -> client() })
+          val owner = GatewayIngressController(scope, registry, storage.persistence, { emptyMap() }, { if (failDrain) throw java.io.IOException("test-only drain failure") }, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
           try {
             val lease = checkNotNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
             if (signOut) {
@@ -2204,7 +2398,7 @@ class GatewayIngressControllerTest {
               if (next == "cancel") throw CancellationException("test-only cancellation")
               throw java.io.IOException("test-only old drain failure")
             }
-          }, clientForRoute = { _, _ -> client() }, authenticate = { _, _ -> CloudflareAccessTestTokens.session("replacement") })
+          }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, _ -> CloudflareAccessTestTokens.session("replacement") })
         val messages = mutableListOf<String>()
         scope.launch(UnconfinedTestDispatcher(testScheduler)) {
           owner.presentation.collect { presentation ->
@@ -2251,7 +2445,7 @@ class GatewayIngressControllerTest {
       storage.values[application.origin] = CloudflareAccessTestTokens.session(expires = now + 1).encode()
       val gate = CompletableDeferred<Unit>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, clientForRoute = { target, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
           client { request ->
             if (target.contextPath == "/replacement") {
               gate.await()
@@ -2286,7 +2480,7 @@ class GatewayIngressControllerTest {
       val registry = registry()
       val storage = Storage()
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
-      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val lease = checkNotNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
       val replacement = endpoint.copy(contextPath = "/other")
       assertTrue(runCatching { owner.prepare(replacement, tls, true, admissionCheckpoint = owner.admissionCheckpoint()) { false } }.exceptionOrNull() is CancellationException)
@@ -2301,7 +2495,7 @@ class GatewayIngressControllerTest {
       var now = System.currentTimeMillis() / 1000.0
       var retirements = 0
       storage.values[application.origin] = CloudflareAccessTestTokens.session(expires = now + 1).encode()
-      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val lease = checkNotNull(owner.prepare(endpoint, tls, false, admissionCheckpoint = owner.admissionCheckpoint()) { true })
       val request = Request.Builder().url("https://gateway.example.test:8443/gateway/socket").build()
       lease.requireCurrent(request)
@@ -2321,7 +2515,7 @@ class GatewayIngressControllerTest {
       add(registry, sibling)
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
 
-      fun owner() = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() })
+      fun owner() = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       val producer = owner()
       producer.prepare(endpoint, tls, false, admissionCheckpoint = producer.admissionCheckpoint()) { true }
       producer.prepare(sibling, tls.copy(stableId = sibling.stableId), false, admissionCheckpoint = producer.admissionCheckpoint()) { true }
@@ -2340,7 +2534,7 @@ class GatewayIngressControllerTest {
       add(registry, sibling)
       val grant = CompletableDeferred<CloudflareAccessSession>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           grant.await()
         })
@@ -2366,6 +2560,7 @@ class GatewayIngressControllerTest {
             storage.persistence,
             { emptyMap() },
             {},
+            registryObserverDispatcher = StandardTestDispatcher(testScheduler),
             clientForRoute = { _, _ -> client { !ordinary && it.header("Cf-Access-Token") == null } },
             authenticate = { _, open ->
               prompts++
@@ -2410,7 +2605,7 @@ class GatewayIngressControllerTest {
         var requests = 0
         var retirements = 0
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, clientForRoute = { _, _ ->
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
             client {
               requests++
               it.header("Cf-Access-Token") == null
@@ -2448,7 +2643,7 @@ class GatewayIngressControllerTest {
         val storage = Storage()
         storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
         var retirements = 0
-        val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, clientForRoute = { _, _ -> client() })
+        val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { retirements++ }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
         val old = checkNotNull(owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true })
         val retained = if (shared) owner.prepare(sibling, tls.copy(stableId = sibling.stableId), false, owner.admissionCheckpoint()) { true } else null
         assertNull(owner.prepare(endpoint, null, false, owner.admissionCheckpoint()) { true })
@@ -2486,7 +2681,7 @@ class GatewayIngressControllerTest {
       val storage = Storage()
       val grant = CompletableDeferred<Unit>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           withContext(NonCancellable) { grant.await() }
           CloudflareAccessTestTokens.session()
@@ -2515,7 +2710,7 @@ class GatewayIngressControllerTest {
       for (mode in listOf("current", "replaced", "canceled")) {
         val registry = registry()
         registry.setAccessOrigin(endpoint.stableId, application.origin)
-        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client { false } })
+        val owner = GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client { false } })
         owner.signOut(endpoint.stableId)?.await()
         val retry = checkNotNull(owner.retry(owner.admissionCheckpoint()) { true })
         if (mode == "replaced") {
@@ -2562,7 +2757,7 @@ class GatewayIngressControllerTest {
           GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {
             entered = true
             drain.await()
-          }, clientForRoute = { _, _ -> client() })
+          }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
         owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
         val pending = async { runCatching { owner.prepare(endpoint, null, false, owner.admissionCheckpoint()) { true } } }
         runCurrent()
@@ -2611,7 +2806,7 @@ class GatewayIngressControllerTest {
       val storage = Storage()
       storage.values[application.origin] = CloudflareAccessTestTokens.session().encode()
       val drain = CompletableDeferred<Unit>()
-      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, clientForRoute = { _, _ -> client() })
+      val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, { drain.await() }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
       owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
       val old = async { runCatching { owner.prepare(endpoint, null, false, owner.admissionCheckpoint()) { true } } }
       runCurrent()
@@ -2647,7 +2842,7 @@ class GatewayIngressControllerTest {
             GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {
               entered = true
               drain.await()
-            }, clientForRoute = { _, _ -> client() })
+            }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() })
           assertTrue(runCatching { owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true } }.exceptionOrNull() is GatewayExternalAuthorizationException)
           val retry = if (useRetry) checkNotNull(owner.retry(owner.admissionCheckpoint()) { current }) else null
           val pending =
@@ -2729,7 +2924,7 @@ class GatewayIngressControllerTest {
             GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {
               entered++
               release.await()
-            }, clientForRoute = { target, _ -> client { target.host == endpoint.host && it.header("Cf-Access-Token") == null } })
+            }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ -> client { target.host == endpoint.host && it.header("Cf-Access-Token") == null } })
           owner.prepare(endpoint, tls, false, owner.admissionCheckpoint()) { true }
 
           suspend fun depart(): GatewayIngressAuthorization? =
@@ -2836,7 +3031,7 @@ class GatewayIngressControllerTest {
                 retirementEntered = true
                 release.await()
               }
-            }, clientForRoute = { target, _ -> client { target.host == endpoint.host && it.header("Cf-Access-Token") == null } }, authenticate = { _, open ->
+            }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ -> client { target.host == endpoint.host && it.header("Cf-Access-Token") == null } }, authenticate = { _, open ->
               prompts++
               open("https://example.cloudflareaccess.com/login")
               CloudflareAccessTestTokens.session("renewed")
@@ -2964,6 +3159,128 @@ class GatewayIngressControllerTest {
       }
     }
 
+  @Test fun survivingParticipantsOwnDelayedBrowserPublicationAndLaterCoalescing() =
+    runTest {
+      for (delayed in listOf(false, true)) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "surviving-browser")
+        val third = endpoint.copy(stableId = "later-browser")
+        add(registry, sibling)
+        add(registry, third)
+        val storage = Storage()
+        val publish = CompletableDeferred<Unit>()
+        val grant = CompletableDeferred<CloudflareAccessSession>()
+        var firstCurrent = true
+        var prompts = 0
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+            prompts++
+            if (delayed) publish.await()
+            open("https://example.cloudflareaccess.com/login")
+            grant.await()
+          })
+        val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { firstCurrent } } }
+        var second: Deferred<GatewayIngressAuthorization?>? = null
+        var last: Deferred<GatewayIngressAuthorization?>? = null
+        try {
+          runCurrent()
+          val queued = owner.presentation.value.browserLaunch
+          assertEquals(!delayed, queued != null)
+          val peer = async { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } }
+          second = peer
+          runCurrent()
+          firstCurrent = false
+          first.cancelAndJoin()
+          val later = async { owner.prepare(third, tls.copy(stableId = third.stableId), true, owner.admissionCheckpoint()) { true } }
+          last = later
+          runCurrent()
+          assertEquals(1, prompts)
+          assertFalse(peer.isCompleted)
+          assertFalse(later.isCompleted)
+          publish.complete(Unit)
+          runCurrent()
+          val launch = checkNotNull(owner.presentation.value.browserLaunch)
+          if (queued != null) assertEquals(queued, launch)
+          if (delayed) {
+            assertEquals(
+              sibling.stableId,
+              owner.presentation.value.attention
+                ?.stableId,
+            )
+          }
+          assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+          assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+          grant.complete(CloudflareAccessTestTokens.session("surviving-subject"))
+          val request = Request.Builder().url(application.origin.uri.toString()).build()
+          checkNotNull(peer.await()).requireCurrent(request)
+          checkNotNull(later.await()).requireCurrent(request)
+          assertEquals("surviving-subject", CloudflareAccessSession.decode(checkNotNull(storage.values[application.origin])).subject)
+          assertNull(owner.presentation.value.attention)
+          assertNull(owner.presentation.value.browserLaunch)
+        } finally {
+          publish.complete(Unit)
+          grant.cancel()
+          first.cancelAndJoin()
+          second?.cancelAndJoin()
+          last?.cancelAndJoin()
+        }
+      }
+    }
+
+  @Test fun browserEligibilityEndsWithParticipantsAndExplicitCancelTargetsTheSurvivor() =
+    runTest {
+      for (retireAll in listOf(false, true)) {
+        val registry = registry()
+        val sibling = endpoint.copy(stableId = "surviving-browser")
+        add(registry, sibling)
+        val storage = Storage()
+        val grant = CompletableDeferred<CloudflareAccessSession>()
+        var authentication: Job? = null
+        var firstCurrent = true
+        val owner =
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+            authentication = kotlin.coroutines.coroutineContext[Job]
+            open("https://example.cloudflareaccess.com/login")
+            grant.await()
+          })
+        val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { firstCurrent } } }
+        var second: Deferred<GatewayIngressAuthorization?>? = null
+        try {
+          runCurrent()
+          val launch = checkNotNull(owner.presentation.value.browserLaunch)
+          val peer = async { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { true } }
+          second = peer
+          runCurrent()
+          firstCurrent = false
+          first.cancelAndJoin()
+          if (retireAll) {
+            peer.cancelAndJoin()
+            assertTrue(checkNotNull(authentication).isActive)
+            assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+          }
+          checkNotNull(owner.cancel(launch.attemptId)).join()
+          runCurrent()
+          assertTrue(runCatching { peer.await() }.exceptionOrNull() is CancellationException)
+          assertFalse(checkNotNull(authentication).isActive)
+          assertNull(owner.presentation.value.browserLaunch)
+          assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+          if (retireAll) {
+            assertNull(owner.presentation.value.attention)
+          } else {
+            val attention = checkNotNull(owner.presentation.value.attention)
+            assertEquals(sibling.stableId, attention.stableId)
+            assertNull(attention.attemptId)
+            assertTrue(attention.message.contains("canceled"))
+          }
+          assertNull(storage.values[application.origin])
+        } finally {
+          grant.cancel()
+          first.cancelAndJoin()
+          second?.cancelAndJoin()
+        }
+      }
+    }
+
   @Test fun cancelingEitherCoalescedWaiterLeavesThePeerAndBrowserOwnerIntact() =
     runTest {
       for (canceledIndex in listOf(0, 1)) {
@@ -2978,45 +3295,53 @@ class GatewayIngressControllerTest {
             val failure = SSLHandshakeException("test-only shared TLS failure")
             var prompts = 0
             val owner =
-              GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+              GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
                 prompts++
                 open("https://example.cloudflareaccess.com/login")
                 grant.await()
               })
             val first = async { runCatching { owner.prepare(endpoint, tls, true, owner.admissionCheckpoint()) { current[0] } } }
             runCurrent()
-            val launch = owner.presentation.value.browserLaunch
+            val launch = checkNotNull(owner.presentation.value.browserLaunch)
             val second = async { runCatching { owner.prepare(sibling, tls.copy(stableId = sibling.stableId), true, owner.admissionCheckpoint()) { current[1] } } }
             runCurrent()
             val callers = listOf(first, second)
-            if (retirement != "job") current[canceledIndex] = false
-            if (retirement != "caller") callers[canceledIndex].cancel()
-            runCurrent()
-            assertEquals(launch, owner.presentation.value.browserLaunch)
-            assertEquals(1, prompts)
-            if (succeeds) grant.complete(CloudflareAccessTestTokens.session()) else grant.completeExceptionally(failure)
-            val retiredError = runCatching { callers[canceledIndex].await().getOrThrow() }.exceptionOrNull()
-            if (!succeeds && retiredError !is CancellationException) {
-              assertTlsFailure(failure, retiredError)
-            } else {
-              assertTrue(retiredError is CancellationException)
+            try {
+              if (retirement != "job") current[canceledIndex] = false
+              if (retirement != "caller") callers[canceledIndex].cancel()
+              runCurrent()
+              assertEquals(launch, owner.presentation.value.browserLaunch)
+              assertEquals(1, prompts)
+              assertEquals(launch.url, owner.consumeBrowserLaunch(launch.attemptId))
+              assertNull(owner.consumeBrowserLaunch(launch.attemptId))
+              if (succeeds) grant.complete(CloudflareAccessTestTokens.session()) else grant.completeExceptionally(failure)
+              val retiredError = runCatching { callers[canceledIndex].await().getOrThrow() }.exceptionOrNull()
+              if (!succeeds && retiredError !is CancellationException) {
+                assertTlsFailure(failure, retiredError)
+              } else {
+                assertTrue(retiredError is CancellationException)
+              }
+              val peer = callers[1 - canceledIndex].await()
+              if (succeeds) {
+                val lease = checkNotNull(peer.getOrThrow())
+                lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
+                assertNotNull(storage.values[application.origin])
+                assertNull(owner.presentation.value.attention)
+              } else {
+                assertTlsFailure(failure, peer.exceptionOrNull())
+                assertNull(storage.values[application.origin])
+                val attention = checkNotNull(owner.presentation.value.attention)
+                assertEquals(if (canceledIndex == 0) sibling.stableId else endpoint.stableId, attention.stableId)
+                assertTrue(attention.message.startsWith("TLS connection failed:"))
+                assertNotNull(owner.retry(owner.admissionCheckpoint()) { true })
+              }
+              assertNull(owner.presentation.value.browserLaunch)
+              assertFalse(owner.blocksAutomaticReconnect(if (canceledIndex == 0) endpoint.stableId else sibling.stableId))
+            } finally {
+              grant.cancel()
+              first.cancelAndJoin()
+              second.cancelAndJoin()
             }
-            val peer = callers[1 - canceledIndex].await()
-            if (succeeds) {
-              val lease = checkNotNull(peer.getOrThrow())
-              lease.requireCurrent(Request.Builder().url(application.origin.uri.toString()).build())
-              assertNotNull(storage.values[application.origin])
-              assertNull(owner.presentation.value.attention)
-            } else {
-              assertTlsFailure(failure, peer.exceptionOrNull())
-              assertNull(storage.values[application.origin])
-              val attention = checkNotNull(owner.presentation.value.attention)
-              assertEquals(if (canceledIndex == 0) sibling.stableId else endpoint.stableId, attention.stableId)
-              assertTrue(attention.message.startsWith("TLS connection failed:"))
-              assertNotNull(owner.retry(owner.admissionCheckpoint()) { true })
-            }
-            assertNull(owner.presentation.value.browserLaunch)
-            assertFalse(owner.blocksAutomaticReconnect(if (canceledIndex == 0) endpoint.stableId else sibling.stableId))
           }
         }
       }
@@ -3037,7 +3362,7 @@ class GatewayIngressControllerTest {
         val failure = SSLHandshakeException("test-only completed shared failure")
         var prompts = 0
         val owner =
-          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+          GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
             val grant = if (++prompts == 1) firstGrant else replacementGrant
             open("https://example.cloudflareaccess.com/login")
             grant.await()
@@ -3106,7 +3431,7 @@ class GatewayIngressControllerTest {
           val probes = mutableListOf<String>()
           var useReplacement = false
           val owner =
-            GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { target, _ ->
+            GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ ->
               client({ if (useReplacement && target.stableId == replacement.stableId) other else application }) { request ->
                 probes += request.url.toString()
                 request.header("Cf-Access-Token") == null
@@ -3165,7 +3490,7 @@ class GatewayIngressControllerTest {
       val other = application.copy(audience = "linked-audience")
       val probes = mutableListOf<Request>()
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ ->
           client({ other }) { request ->
             probes += request
             request.header("Cf-Access-Token") == null
@@ -3194,7 +3519,7 @@ class GatewayIngressControllerTest {
       val failure = SSLHandshakeException("test-only completed shared failure")
       var prompts = 0
       val owner =
-        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, Storage().persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           val grant = if (++prompts == 1) firstGrant else replacementGrant
           open("https://example.cloudflareaccess.com/login")
           grant.await()
@@ -3245,7 +3570,7 @@ class GatewayIngressControllerTest {
           var now = System.currentTimeMillis() / 1000.0
           storage.values[application.origin] = CloudflareAccessTestTokens.session(expires = now + 1).encode()
           var ordinaryReady = false
-          val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, now = { now }, clientForRoute = { target, _ -> client { !(ordinaryReady && target.stableId == ordinary.stableId) && it.header("Cf-Access-Token") == null } })
+          val owner = GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, now = { now }, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { target, _ -> client { !(ordinaryReady && target.stableId == ordinary.stableId) && it.header("Cf-Access-Token") == null } })
           if (formerlyManaged) owner.prepare(ordinary, tls.copy(stableId = ordinary.stableId), false, owner.admissionCheckpoint()) { true }
           ordinaryReady = true
           assertNull(owner.prepare(ordinary, tls.copy(stableId = ordinary.stableId), false, owner.admissionCheckpoint()) { true })
@@ -3270,7 +3595,7 @@ class GatewayIngressControllerTest {
       val storage = Storage()
       val failure = SSLHandshakeException("gateway TLS fingerprint mismatch")
       val owner =
-        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
+        GatewayIngressController(backgroundScope, registry, storage.persistence, { emptyMap() }, {}, registryObserverDispatcher = StandardTestDispatcher(testScheduler), clientForRoute = { _, _ -> client() }, authenticate = { _, open ->
           open("https://example.cloudflareaccess.com/login")
           throw failure
         })

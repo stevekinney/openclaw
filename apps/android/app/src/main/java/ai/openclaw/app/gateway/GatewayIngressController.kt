@@ -1,9 +1,11 @@
 package ai.openclaw.app.gateway
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -48,6 +50,8 @@ internal class GatewayIngressController(
   private val retireTransports: suspend (CloudflareAccessOrigin) -> Unit,
   private val now: () -> Double = { System.currentTimeMillis() / 1000.0 },
   private val clientForRoute: (GatewayEndpoint, GatewayTlsParams) -> CloudflareAccessClient = ::routeClient,
+  // This observer must queue delivery; inline dispatch would invert Registry and ingress monitors.
+  registryObserverDispatcher: CoroutineDispatcher = Dispatchers.Default,
   authenticate: suspend (CloudflareAccessApplication, suspend (String) -> Unit) -> CloudflareAccessSession =
     { application, browser -> CloudflareAccessTransfer().signIn(application, browser) },
 ) {
@@ -86,13 +90,19 @@ internal class GatewayIngressController(
       get() = completedAction ?: action
   }
 
+  private class BrowserParticipant(
+    val registration: Registration,
+    val context: kotlin.coroutines.CoroutineContext,
+    val isCurrent: () -> Boolean,
+  )
+
   private class BrowserIntent(
     val id: UUID,
     val application: CloudflareAccessApplication,
     val registration: Registration,
-    val isCurrent: () -> Boolean,
   ) {
     val canceled = AtomicBoolean(false)
+    val participants = mutableSetOf<BrowserParticipant>()
 
     @Volatile var task: Deferred<CloudflareAccessSessionStore.Snapshot>? = null
   }
@@ -119,8 +129,14 @@ internal class GatewayIngressController(
     }
 
   init {
-    scope.launch {
-      registry.entries.collect { synchronized(lock) { publishLocked() } }
+    scope.launch(registryObserverDispatcher) {
+      val context = kotlin.coroutines.coroutineContext
+      registry.entries.collect {
+        synchronized(lock) {
+          context.ensureActive()
+          publishLocked()
+        }
+      }
     }
   }
 
@@ -350,10 +366,10 @@ internal class GatewayIngressController(
         browserIntent?.takeIf { it.id == id }?.also {
           // Retire the consumer synchronously, even if the store already committed and
           // its waiter has not resumed. A queued browser launch must retire with it.
-          val current = isLiveIntentLocked(it)
+          val current = liveParticipantLocked(it)
           it.canceled.set(true)
           publishLocked(
-            attention = if (current) GatewayAccessAttention(it.registration.endpoint.stableId, message) else mutablePresentation.value.attention.takeUnless { attention -> attention?.attemptId == it.id },
+            attention = if (current != null) GatewayAccessAttention(current.registration.endpoint.stableId, message) else mutablePresentation.value.attention.takeUnless { attention -> attention?.attemptId == it.id },
             browserLaunch = mutablePresentation.value.browserLaunch.takeUnless { launch -> launch?.attemptId == it.id },
           )
         }
@@ -625,93 +641,107 @@ internal class GatewayIngressController(
     admissionCheckpoint: Long,
     isCurrent: () -> Boolean,
   ): CloudflareAccessSessionStore.Snapshot {
-    val (intent, task) =
-      browserMutex.withLock {
-        checkRegistration(registration, isCurrent)
-        val reusable =
-          synchronized(lock) {
-            checkRegistrationLocked(registration, isCurrent)
-            browserIntent?.takeIf { isLiveIntentLocked(it) && it.application == application }?.let { intent ->
-              intent.task?.takeUnless { it.isCompleted }?.let { intent to it }
-            }
-          }
-        // Capture one attempt and its task. Reacquiring from Store after this check
-        // could attach a fresh task to an intent whose old waiters have not resumed.
-        if (reusable != null) return@withLock reusable
-        synchronized(lock) { browserIntent }?.let { cancelExisting(it) }
-        checkRegistration(registration, isCurrent)
-        val intent =
-          synchronized(lock) {
-            checkRegistrationLocked(registration, isCurrent)
-            BrowserIntent(UUID.randomUUID(), application, registration, isCurrent).also { browserIntent = it }
-          }
-        val task =
-          store.signIn(application, admissionCheckpoint) { url ->
+    val participant = BrowserParticipant(registration, kotlin.coroutines.coroutineContext, isCurrent)
+    var joinedIntent: BrowserIntent? = null
+    try {
+      val (intent, task) =
+        browserMutex.withLock {
+          checkRegistration(registration, isCurrent)
+          val reusable =
             synchronized(lock) {
               checkRegistrationLocked(registration, isCurrent)
-              if (!isLiveIntentLocked(intent)) throw CancellationException()
-              publishLocked(
-                attention =
-                  GatewayAccessAttention(
-                    intent.registration.endpoint.stableId,
-                    "After approving sign-in, close the browser tab to return to OpenClaw.",
-                    intent.id,
-                  ),
-                browserLaunch = GatewayAccessBrowserLaunch(intent.id, url),
-              )
+              browserIntent?.takeIf { isLiveIntentLocked(it) && it.application == application }?.let { intent ->
+                intent.task?.takeUnless { it.isCompleted }?.let { task ->
+                  intent.participants.add(participant)
+                  joinedIntent = intent
+                  intent to task
+                }
+              }
             }
-          }
-        intent.task = task
-        if (intent.canceled.get()) task.cancel()
-        intent to task
-      }
-    try {
-      val result = task.await()
-      kotlin.coroutines.coroutineContext.ensureActive()
-      synchronized(lock) {
-        checkRegistrationLocked(registration, isCurrent)
-        if (intent.canceled.get()) throw CancellationException("Gateway sign-in canceled")
-        if (result.session.application != application) throw CloudflareAccessException(CloudflareAccessException.Kind.InvalidSession)
-        // Completion belongs to the shared intent; any current waiter can settle it
-        // even after the caller that originally presented its browser has retired.
-        if (browserIntent === intent && intent.task === task) {
-          browserIntent = null
-          publishLocked(attention = null, browserLaunch = null)
+          // Capture one attempt and its task. Reacquiring from Store after this check
+          // could attach a fresh task to an intent whose old waiters have not resumed.
+          if (reusable != null) return@withLock reusable
+          synchronized(lock) { browserIntent }?.let { cancelExisting(it) }
+          checkRegistration(registration, isCurrent)
+          val intent =
+            synchronized(lock) {
+              checkRegistrationLocked(registration, isCurrent)
+              BrowserIntent(UUID.randomUUID(), application, registration).also {
+                it.participants.add(participant)
+                joinedIntent = it
+                browserIntent = it
+              }
+            }
+          val task =
+            store.signIn(application, admissionCheckpoint) { url ->
+              synchronized(lock) {
+                val current = liveParticipantLocked(intent) ?: throw CancellationException()
+                publishLocked(
+                  attention =
+                    GatewayAccessAttention(
+                      current.registration.endpoint.stableId,
+                      "After approving sign-in, close the browser tab to return to OpenClaw.",
+                      intent.id,
+                    ),
+                  browserLaunch = GatewayAccessBrowserLaunch(intent.id, url),
+                )
+              }
+            }
+          intent.task = task
+          if (intent.canceled.get()) task.cancel()
+          intent to task
         }
-      }
-      return result
-    } catch (error: Exception) {
-      val context = kotlin.coroutines.coroutineContext
-      synchronized(lock) {
-        val callerCurrent =
-          try {
-            context.ensureActive()
-            isCurrent()
-          } catch (_: CancellationException) {
-            false
+      try {
+        val result = task.await()
+        kotlin.coroutines.coroutineContext.ensureActive()
+        synchronized(lock) {
+          checkRegistrationLocked(registration, isCurrent)
+          if (intent.canceled.get()) throw CancellationException("Gateway sign-in canceled")
+          if (result.session.application != application) throw CloudflareAccessException(CloudflareAccessException.Kind.InvalidSession)
+          // Completion belongs to the shared intent; any current waiter can settle it
+          // even after the caller that originally presented its browser has retired.
+          if (browserIntent === intent && intent.task === task) {
+            browserIntent = null
+            publishLocked(attention = null, browserLaunch = null)
           }
-        // A shared task's retired waiter cannot clear the surviving browser owner
-        // or publish a retry action for a forgotten/replaced profile.
-        if (browserIntent === intent && intent.task === task && !intent.canceled.get() && task.isCompleted && callerCurrent &&
-          isRegisteredLocked(registration)
-        ) {
-          browserIntent = null
-          publishLocked(
-            attention =
-              GatewayAccessAttention(
-                registration.endpoint.stableId,
-                when (error) {
-                  is CancellationException -> "Sign-in canceled. Sign in again to reconnect."
-                  is SSLException -> "TLS connection failed: ${error.message ?: "certificate validation failed"}"
-                  is IOException -> "Connection failed: ${error.message ?: "network unavailable"}"
-                  else -> error.message ?: "Sign-in failed. Try again."
-                },
-              ),
-            browserLaunch = null,
-          )
         }
+        return result
+      } catch (error: Exception) {
+        val context = kotlin.coroutines.coroutineContext
+        synchronized(lock) {
+          val callerCurrent =
+            try {
+              context.ensureActive()
+              isCurrent()
+            } catch (_: CancellationException) {
+              false
+            }
+          // A shared task's retired waiter cannot clear the surviving browser owner
+          // or publish a retry action for a forgotten/replaced profile.
+          if (browserIntent === intent && intent.task === task && !intent.canceled.get() && task.isCompleted && callerCurrent &&
+            isRegisteredLocked(registration)
+          ) {
+            browserIntent = null
+            publishLocked(
+              attention =
+                GatewayAccessAttention(
+                  registration.endpoint.stableId,
+                  when (error) {
+                    is CancellationException -> "Sign-in canceled. Sign in again to reconnect."
+                    is SSLException -> "TLS connection failed: ${error.message ?: "certificate validation failed"}"
+                    is IOException -> "Connection failed: ${error.message ?: "network unavailable"}"
+                    else -> error.message ?: "Sign-in failed. Try again."
+                  },
+                ),
+              browserLaunch = null,
+            )
+          }
+        }
+        throw error
       }
-      throw error
+    } finally {
+      // The Store owns authentication lifetime. Detaching a waiter only removes its browser eligibility.
+      synchronized(lock) { joinedIntent?.participants?.remove(participant) }
     }
   }
 
@@ -902,7 +932,19 @@ internal class GatewayIngressController(
       it?.stableId == registration.endpoint.stableId && browserIntent?.let(::isLiveIntentLocked) != true
     }
 
-  private fun isLiveIntentLocked(intent: BrowserIntent): Boolean = browserIntent === intent && !intent.canceled.get() && isRegisteredLocked(intent.registration) && callerIsCurrent(intent.isCurrent)
+  private fun isLiveIntentLocked(intent: BrowserIntent): Boolean = liveParticipantLocked(intent) != null
+
+  private fun liveParticipantLocked(intent: BrowserIntent): BrowserParticipant? {
+    if (browserIntent !== intent || intent.canceled.get()) return null
+    // Caller predicates may reenter the owner; use a snapshot and recheck ownership after each predicate.
+    return intent.participants.toList().firstOrNull { participant ->
+      callerIsCurrent {
+        participant.context.ensureActive()
+        participant.isCurrent()
+      } && isRegisteredLocked(participant.registration) && browserIntent === intent &&
+        !intent.canceled.get() && participant in intent.participants
+    }
+  }
 
   private fun callerIsCurrent(isCurrent: () -> Boolean): Boolean =
     try {
