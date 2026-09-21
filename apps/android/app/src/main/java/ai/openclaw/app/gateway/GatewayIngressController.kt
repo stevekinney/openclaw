@@ -294,7 +294,7 @@ internal class GatewayIngressController(
           publishLocked(
             attention =
               when {
-                ownsIntent && presentation.attention?.attemptId == intent.id -> participant?.let { presentation.attention?.copy(stableId = it.registration.endpoint.stableId) }
+                ownsIntent && presentation.attention?.attemptId == intent.id -> participant?.let { presentation.attention.copy(stableId = it.registration.endpoint.stableId) }
                 presentation.attention?.stableId == endpoint.stableId -> null
                 else -> presentation.attention
               },
