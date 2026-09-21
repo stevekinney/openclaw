@@ -548,10 +548,12 @@ class CloudflareAccessSessionStoreTest {
       val storage = Storage()
       val store = CloudflareAccessSessionStore(backgroundScope, storage.persistence, authenticate = { _, _ -> CloudflareAccessTestTokens.session("renewed") }, retireTransports = {})
       val monitor =
-        CloudflareAccessSessionStore::class.java
-          .getDeclaredField("lock")
-          .apply { isAccessible = true }
-          .get(store)
+        checkNotNull(
+          CloudflareAccessSessionStore::class.java
+            .getDeclaredField("lock")
+            .apply { isAccessible = true }
+            .get(store),
+        )
       val first = store.forget(application.origin)
       first.task.await()
       store.forget(CloudflareAccessOrigin.from("https://other.example.test")).task.await()
